@@ -82,6 +82,25 @@ export interface VerificationRecord {
 
 /** Engine configuration. Grows with milestones (.aireview.toml keys land at M2). */
 export interface EngineConfig {
+  /**
+   * LLM API PROTOCOL: "openai" = any OpenAI-compatible /chat/completions
+   * endpoint, "anthropic" = any Anthropic /v1/messages endpoint, "gemini" =
+   * Google AI Studio. When set, drives provider construction via buildProvider;
+   * when absent, the REVIEW_MODEL shortcut (resolveProviderChoice) is used.
+   */
+  provider?: "openai" | "anthropic" | "gemini";
+  /** Model id for the selected provider. Required (no default) for provider "openai". */
+  model?: string;
+  /** Base URL or preset keyword for "openai"; endpoint override for anthropic/gemini. */
+  baseUrl?: string;
+  /** Explicit API key; otherwise resolved from env (LLM_API_KEY → provider-specific). */
+  apiKey?: string;
+  /**
+   * Stronger model for risk escalation: rebuilds the SAME provider/baseUrl/apiKey
+   * with this model. When unset, only the anthropic protocol (or the haiku
+   * shortcut) escalates, to its Sonnet default; other endpoints don't escalate.
+   */
+  escalationModel?: string;
   /** Findings below this severity are never published (overrides .aireview.toml). */
   minSeverity?: Severity;
   /** Path to the repo config file, read at the PR head. Default ".aireview.toml". */

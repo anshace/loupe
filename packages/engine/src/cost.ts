@@ -22,7 +22,12 @@ export const PRICES_USD_PER_MTOK: Record<string, { input: number; output: number
   "llama-3.3-70b-versatile": { input: 0, output: 0 },
 };
 
-/** Cost of a call in USD. Unknown models cost $0 (mock/test providers). */
+/**
+ * Cost of a call in USD. Unknown models cost $0 — this covers mock/test
+ * providers AND any arbitrary OpenAI-compatible model whose pricing we can't
+ * know. Such models simply don't accrue against the USD monthly budget (the
+ * per-run TOKEN cap still applies unchanged). Never crashes on an unknown model.
+ */
 export function costUsd(model: string, inputTokens: number, outputTokens: number): number {
   const price = PRICES_USD_PER_MTOK[model];
   if (!price) return 0;

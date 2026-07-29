@@ -58,8 +58,14 @@ import {
   prStateKey,
 } from "./state";
 import { parseModelFindings, parseToolCalls } from "./guardrail";
-import type { ReviewModel } from "./model";
-import { AnthropicProvider, FREE_TIER_PROVIDER, resolveProviderChoice, selectProvider } from "./model";
+import type { ProviderChoice, ReviewModel } from "./model";
+import {
+  FREE_TIER_PROVIDER,
+  buildProvider,
+  providerChoiceConfig,
+  resolveProviderChoice,
+  selectProvider,
+} from "./model";
 import { filterNoise } from "./noise";
 import { formatCommentableLines, loadPromptTemplate, renderPrompt } from "./prompt";
 import type { ScopeExpander } from "./scope";
@@ -200,6 +206,18 @@ function emptyResult(reason: string): ReviewResult {
     notices: [],
     earlyStop: false,
   };
+}
+
+/**
+ * The stronger model to escalate a risky diff to, or undefined when escalation
+ * can't be resolved. An explicit escalationModel wins for any protocol; failing
+ * that, only the anthropic protocol (or the haiku shortcut) has a known default
+ * (Sonnet). An arbitrary OpenAI-compatible endpoint has no guessable upgrade.
+ */
+function escalationTarget(config: EngineConfig, backCompatChoice?: ProviderChoice): string | undefined {
+  if (config.escalationModel) return config.escalationModel;
+  if (config.provider === "anthropic" || backCompatChoice === "haiku") return ESCALATION_MODEL;
+  return undefined;
 }
 
 interface LoadedRepoConfig {
@@ -343,22 +361,55 @@ export async function runReview(
   let escalated = false;
   let model = deps.model;
   if (!model) {
-    let choice = resolveProviderChoice(env);
-    let budgetDegraded = false;
-    if (isOverMonthlyBudget(env, config.ledgerPath, now(), deps.ledgerIo)) {
-      if (choice !== FREE_TIER_PROVIDER) {
-        notices.push("monthly budget exceeded — degraded to the free-tier model for this run");
+    const overBudget = isOverMonthlyBudget(env, config.ledgerPath, now(), deps.ledgerIo);
+    // Risky paths (auth/payment/billing/migration/crypto/secret) escalate.
+    const risky = (config.escalation ?? true) && shouldEscalate(kept.map((f) => f.path));
+
+    if (config.provider) {
+      // ── Unified provider scheme: provider = the wire protocol.
+      const base: Parameters<typeof buildProvider>[0] = {
+        provider: config.provider,
+        model: config.model,
+        baseUrl: config.baseUrl,
+        apiKey: config.apiKey,
+        fetchImpl,
+        env,
+      };
+      if (overBudget) {
+        if (config.provider !== "gemini") {
+          notices.push("monthly budget exceeded — degraded to the free-tier model for this run");
+        }
+        model = buildProvider({ provider: "gemini", fetchImpl, env });
+      } else {
+        const target = risky ? escalationTarget(config) : undefined;
+        if (target) {
+          model = buildProvider({ ...base, model: target });
+          escalated = true;
+          notices.push(`risky paths in this diff — review escalated to ${target}`);
+        } else {
+          model = buildProvider(base);
+        }
       }
-      choice = FREE_TIER_PROVIDER;
-      budgetDegraded = true;
-    }
-    if (!budgetDegraded && (config.escalation ?? true) && shouldEscalate(kept.map((f) => f.path))) {
-      // Risky paths (auth/payment/billing/migration/crypto/secret) → Sonnet.
-      model = new AnthropicProvider({ model: ESCALATION_MODEL, fetchImpl });
-      escalated = true;
-      notices.push(`risky paths in this diff — review escalated to ${ESCALATION_MODEL}`);
     } else {
-      model = selectProvider(choice, fetchImpl);
+      // ── Back-compat: REVIEW_MODEL / resolveProviderChoice shortcuts.
+      let choice = resolveProviderChoice(env);
+      let budgetDegraded = false;
+      if (overBudget) {
+        if (choice !== FREE_TIER_PROVIDER) {
+          notices.push("monthly budget exceeded — degraded to the free-tier model for this run");
+        }
+        choice = FREE_TIER_PROVIDER;
+        budgetDegraded = true;
+      }
+      const target = !budgetDegraded && risky ? escalationTarget(config, choice) : undefined;
+      if (target) {
+        // Rebuild the shortcut's provider with the stronger model.
+        model = buildProvider({ ...providerChoiceConfig(choice), model: target, fetchImpl, env });
+        escalated = true;
+        notices.push(`risky paths in this diff — review escalated to ${target}`);
+      } else {
+        model = selectProvider(choice, fetchImpl);
+      }
     }
   }
   const tracker = new CostTracker(config.tokenCaps);

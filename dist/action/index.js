@@ -30456,7 +30456,12 @@ exports.PRICES_USD_PER_MTOK = {
     // Groq Llama free tier fallback.
     "llama-3.3-70b-versatile": { input: 0, output: 0 },
 };
-/** Cost of a call in USD. Unknown models cost $0 (mock/test providers). */
+/**
+ * Cost of a call in USD. Unknown models cost $0 — this covers mock/test
+ * providers AND any arbitrary OpenAI-compatible model whose pricing we can't
+ * know. Such models simply don't accrue against the USD monthly budget (the
+ * per-run TOKEN cap still applies unchanged). Never crashes on an unknown model.
+ */
 function costUsd(model, inputTokens, outputTokens) {
     const price = exports.PRICES_USD_PER_MTOK[model];
     if (!price)
@@ -31247,9 +31252,16 @@ __exportStar(__nccwpck_require__(8573), exports);
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.MockProvider = exports.FREE_TIER_PROVIDER = exports.GroqProvider = exports.AnthropicProvider = exports.GeminiFlashProvider = void 0;
+exports.MockProvider = exports.FREE_TIER_PROVIDER = exports.GroqProvider = exports.OpenAICompatibleProvider = exports.OPENAI_COMPATIBLE_PRESETS = exports.AnthropicProvider = exports.GeminiFlashProvider = void 0;
+exports.resolveOpenAIBaseUrl = resolveOpenAIBaseUrl;
 exports.resolveProviderChoice = resolveProviderChoice;
+exports.providerChoiceConfig = providerChoiceConfig;
+exports.buildProvider = buildProvider;
 exports.selectProvider = selectProvider;
+/** Strip a single trailing slash so `${base}/path` never doubles up. */
+function stripTrailingSlash(url) {
+    return url.endsWith("/") ? url.slice(0, -1) : url;
+}
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 /** Google AI Studio REST provider for gemini-2.5-flash (free tier). */
 class GeminiFlashProvider {
@@ -31264,7 +31276,8 @@ class GeminiFlashProvider {
         if (!apiKey)
             throw new Error("GEMINI_API_KEY is not set and no apiKey was provided");
         const fetchImpl = this.opts.fetchImpl ?? fetch;
-        const res = await fetchImpl(`${GEMINI_BASE}/${this.name}:generateContent`, {
+        const base = stripTrailingSlash(this.opts.baseUrl ?? GEMINI_BASE);
+        const res = await fetchImpl(`${base}/${this.name}:generateContent`, {
             method: "POST",
             headers: {
                 "content-type": "application/json",
@@ -31296,6 +31309,7 @@ exports.GeminiFlashProvider = GeminiFlashProvider;
  * Anthropic Messages API provider — Claude Haiku 4.5 by default (design
  * decision 4: quality default from M2). The stable system prompt block gets
  * `cache_control: {type: "ephemeral"}` so repeat reviews hit the prompt cache.
+ * `baseUrl` lets it target any Anthropic-compatible endpoint.
  */
 class AnthropicProvider {
     name;
@@ -31309,7 +31323,8 @@ class AnthropicProvider {
         if (!apiKey)
             throw new Error("ANTHROPIC_API_KEY is not set and no apiKey was provided");
         const fetchImpl = this.opts.fetchImpl ?? fetch;
-        const res = await fetchImpl("https://api.anthropic.com/v1/messages", {
+        const base = stripTrailingSlash(this.opts.baseUrl ?? "https://api.anthropic.com");
+        const res = await fetchImpl(`${base}/v1/messages`, {
             method: "POST",
             headers: {
                 "content-type": "application/json",
@@ -31346,38 +31361,75 @@ class AnthropicProvider {
     }
 }
 exports.AnthropicProvider = AnthropicProvider;
-/** Groq (OpenAI-compatible chat completions) provider — free Llama fallback. */
-class GroqProvider {
+/**
+ * Known OpenAI-compatible base URLs. A base-url input may be one of these
+ * preset keywords OR a full http(s):// URL (used verbatim). Add more freely —
+ * any server speaking the chat-completions shape works via a full URL too.
+ */
+exports.OPENAI_COMPATIBLE_PRESETS = {
+    openai: "https://api.openai.com/v1",
+    openrouter: "https://openrouter.ai/api/v1",
+    groq: "https://api.groq.com/openai/v1",
+    deepseek: "https://api.deepseek.com",
+    together: "https://api.together.xyz/v1",
+};
+/**
+ * Resolve a base-url input to a URL: a full http(s):// value is used verbatim
+ * (trailing slash stripped); a bare keyword is looked up in the preset map;
+ * an unknown keyword throws a clear error. Defaults to the OpenAI preset.
+ */
+function resolveOpenAIBaseUrl(value) {
+    const raw = (value ?? "openai").trim();
+    if (/^https?:\/\//i.test(raw))
+        return stripTrailingSlash(raw);
+    const preset = exports.OPENAI_COMPATIBLE_PRESETS[raw.toLowerCase()];
+    if (preset)
+        return preset;
+    throw new Error(`unknown base-url "${raw}" — pass a full http(s):// URL or one of: ${Object.keys(exports.OPENAI_COMPATIBLE_PRESETS).join(", ")}`);
+}
+/**
+ * Provider for any OpenAI-compatible chat-completions endpoint. POSTs to
+ * `${baseUrl}/chat/completions` with a Bearer key. baseUrl is used as given
+ * (no forced `/v1`), so both `.../v1` and bare-host endpoints work.
+ */
+class OpenAICompatibleProvider {
     name;
     opts;
-    constructor(opts = {}) {
+    constructor(opts) {
         this.opts = opts;
-        this.name = opts.model ?? "llama-3.3-70b-versatile";
+        this.name = opts.model;
     }
     async complete(req) {
-        const apiKey = this.opts.apiKey ?? process.env.GROQ_API_KEY;
+        const apiKeyEnv = this.opts.apiKeyEnv ?? "LLM_API_KEY";
+        const apiKey = this.opts.apiKey ?? process.env[apiKeyEnv];
         if (!apiKey)
-            throw new Error("GROQ_API_KEY is not set and no apiKey was provided");
+            throw new Error(`${apiKeyEnv} is not set and no apiKey was provided`);
         const fetchImpl = this.opts.fetchImpl ?? fetch;
-        const res = await fetchImpl("https://api.groq.com/openai/v1/chat/completions", {
+        const url = `${stripTrailingSlash(this.opts.baseUrl)}/chat/completions`;
+        const body = {
+            model: this.name,
+            max_tokens: this.opts.maxTokens ?? 8192,
+            temperature: this.opts.temperature ?? 0.2,
+            messages: [
+                { role: "system", content: req.system },
+                { role: "user", content: req.user },
+            ],
+        };
+        if (this.opts.responseFormat ?? true) {
+            body.response_format = { type: "json_object" };
+        }
+        const res = await fetchImpl(url, {
             method: "POST",
             headers: {
                 "content-type": "application/json",
                 authorization: `Bearer ${apiKey}`,
+                ...this.opts.extraHeaders,
             },
-            body: JSON.stringify({
-                model: this.name,
-                max_tokens: this.opts.maxTokens ?? 8192,
-                temperature: 0.2,
-                messages: [
-                    { role: "system", content: req.system },
-                    { role: "user", content: req.user },
-                ],
-            }),
+            body: JSON.stringify(body),
         });
         if (!res.ok) {
-            const body = (await res.text()).slice(0, 300);
-            throw new Error(`Groq API error: HTTP ${res.status} ${body}`);
+            const text = (await res.text()).slice(0, 300);
+            throw new Error(`OpenAI-compatible API error: HTTP ${res.status} ${text}`);
         }
         const json = JSON.parse(await res.text());
         return {
@@ -31385,6 +31437,23 @@ class GroqProvider {
             inputTokens: json.usage?.prompt_tokens ?? 0,
             outputTokens: json.usage?.completion_tokens ?? 0,
         };
+    }
+}
+exports.OpenAICompatibleProvider = OpenAICompatibleProvider;
+/**
+ * Groq — a thin preset of OpenAICompatibleProvider (kept for back-compat).
+ * Free Llama fallback; reads GROQ_API_KEY when no apiKey is provided.
+ */
+class GroqProvider extends OpenAICompatibleProvider {
+    constructor(opts = {}) {
+        super({
+            baseUrl: exports.OPENAI_COMPATIBLE_PRESETS.groq,
+            model: opts.model ?? "llama-3.3-70b-versatile",
+            apiKey: opts.apiKey,
+            apiKeyEnv: "GROQ_API_KEY",
+            maxTokens: opts.maxTokens,
+            fetchImpl: opts.fetchImpl,
+        });
     }
 }
 exports.GroqProvider = GroqProvider;
@@ -31397,16 +31466,71 @@ function resolveProviderChoice(env) {
         return raw;
     return "haiku";
 }
-/** Construct the provider for a choice. Provider swaps are config, not code. */
-function selectProvider(choice, fetchImpl) {
+/**
+ * apiKey resolution: explicit → LLM_API_KEY → provider-specific vars, in order.
+ * Returns undefined when nothing is set (the provider then reads its own env
+ * var at call time, or throws a clear missing-key error).
+ */
+function resolveApiKey(explicit, env, ...providerVars) {
+    if (explicit)
+        return explicit;
+    if (env.LLM_API_KEY)
+        return env.LLM_API_KEY;
+    for (const v of providerVars) {
+        if (env[v])
+            return env[v];
+    }
+    return undefined;
+}
+/** The buildProvider config for a back-compat REVIEW_MODEL shortcut. */
+function providerChoiceConfig(choice) {
     switch (choice) {
         case "gemini":
-            return new GeminiFlashProvider({ fetchImpl });
-        case "groq":
-            return new GroqProvider({ fetchImpl });
+            return { provider: "gemini" };
         case "haiku":
-            return new AnthropicProvider({ fetchImpl });
+            return { provider: "anthropic", model: "claude-haiku-4-5" };
+        case "groq":
+            return { provider: "openai", baseUrl: "groq", model: "llama-3.3-70b-versatile" };
     }
+}
+/**
+ * Unified provider builder. `provider` selects the wire protocol; the rest is
+ * configuration. The openai protocol requires an explicit model (no silent
+ * default for an arbitrary endpoint) and resolves baseUrl via the preset map.
+ */
+function buildProvider(cfg) {
+    const env = cfg.env ?? process.env;
+    switch (cfg.provider) {
+        case "gemini":
+            return new GeminiFlashProvider({
+                model: cfg.model,
+                apiKey: resolveApiKey(cfg.apiKey, env, "GEMINI_API_KEY"),
+                baseUrl: cfg.baseUrl,
+                fetchImpl: cfg.fetchImpl,
+            });
+        case "anthropic":
+            return new AnthropicProvider({
+                model: cfg.model,
+                apiKey: resolveApiKey(cfg.apiKey, env, "ANTHROPIC_API_KEY"),
+                baseUrl: cfg.baseUrl,
+                fetchImpl: cfg.fetchImpl,
+            });
+        case "openai": {
+            if (!cfg.model) {
+                throw new Error('provider "openai" requires an explicit model — set the `model` input (there is no default for an arbitrary OpenAI-compatible endpoint)');
+            }
+            return new OpenAICompatibleProvider({
+                baseUrl: resolveOpenAIBaseUrl(cfg.baseUrl),
+                model: cfg.model,
+                apiKey: resolveApiKey(cfg.apiKey, env, "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY"),
+                fetchImpl: cfg.fetchImpl,
+            });
+        }
+    }
+}
+/** Construct the provider for a back-compat shortcut, in terms of buildProvider. */
+function selectProvider(choice, fetchImpl) {
+    return buildProvider({ ...providerChoiceConfig(choice), fetchImpl });
 }
 /** Canned-response provider for tests and offline dev. Never touches the network. */
 class MockProvider {
@@ -31811,6 +31935,19 @@ function emptyResult(reason) {
         earlyStop: false,
     };
 }
+/**
+ * The stronger model to escalate a risky diff to, or undefined when escalation
+ * can't be resolved. An explicit escalationModel wins for any protocol; failing
+ * that, only the anthropic protocol (or the haiku shortcut) has a known default
+ * (Sonnet). An arbitrary OpenAI-compatible endpoint has no guessable upgrade.
+ */
+function escalationTarget(config, backCompatChoice) {
+    if (config.escalationModel)
+        return config.escalationModel;
+    if (config.provider === "anthropic" || backCompatChoice === "haiku")
+        return escalate_1.ESCALATION_MODEL;
+    return undefined;
+}
 async function loadRepoConfig(pr, auth, headSha, fetchImpl, injected, configPath = config_1.AIREVIEW_CONFIG_PATH) {
     const files = injected ?? {
         config: await (0, config_1.fetchRepoFile)(pr, auth, configPath, headSha, fetchImpl),
@@ -31921,23 +32058,58 @@ async function runReview(pr, auth, config = {}, deps = {}) {
     let escalated = false;
     let model = deps.model;
     if (!model) {
-        let choice = (0, model_1.resolveProviderChoice)(env);
-        let budgetDegraded = false;
-        if ((0, cost_1.isOverMonthlyBudget)(env, config.ledgerPath, now(), deps.ledgerIo)) {
-            if (choice !== model_1.FREE_TIER_PROVIDER) {
-                notices.push("monthly budget exceeded — degraded to the free-tier model for this run");
+        const overBudget = (0, cost_1.isOverMonthlyBudget)(env, config.ledgerPath, now(), deps.ledgerIo);
+        // Risky paths (auth/payment/billing/migration/crypto/secret) escalate.
+        const risky = (config.escalation ?? true) && (0, escalate_1.shouldEscalate)(kept.map((f) => f.path));
+        if (config.provider) {
+            // ── Unified provider scheme: provider = the wire protocol.
+            const base = {
+                provider: config.provider,
+                model: config.model,
+                baseUrl: config.baseUrl,
+                apiKey: config.apiKey,
+                fetchImpl,
+                env,
+            };
+            if (overBudget) {
+                if (config.provider !== "gemini") {
+                    notices.push("monthly budget exceeded — degraded to the free-tier model for this run");
+                }
+                model = (0, model_1.buildProvider)({ provider: "gemini", fetchImpl, env });
             }
-            choice = model_1.FREE_TIER_PROVIDER;
-            budgetDegraded = true;
-        }
-        if (!budgetDegraded && (config.escalation ?? true) && (0, escalate_1.shouldEscalate)(kept.map((f) => f.path))) {
-            // Risky paths (auth/payment/billing/migration/crypto/secret) → Sonnet.
-            model = new model_1.AnthropicProvider({ model: escalate_1.ESCALATION_MODEL, fetchImpl });
-            escalated = true;
-            notices.push(`risky paths in this diff — review escalated to ${escalate_1.ESCALATION_MODEL}`);
+            else {
+                const target = risky ? escalationTarget(config) : undefined;
+                if (target) {
+                    model = (0, model_1.buildProvider)({ ...base, model: target });
+                    escalated = true;
+                    notices.push(`risky paths in this diff — review escalated to ${target}`);
+                }
+                else {
+                    model = (0, model_1.buildProvider)(base);
+                }
+            }
         }
         else {
-            model = (0, model_1.selectProvider)(choice, fetchImpl);
+            // ── Back-compat: REVIEW_MODEL / resolveProviderChoice shortcuts.
+            let choice = (0, model_1.resolveProviderChoice)(env);
+            let budgetDegraded = false;
+            if (overBudget) {
+                if (choice !== model_1.FREE_TIER_PROVIDER) {
+                    notices.push("monthly budget exceeded — degraded to the free-tier model for this run");
+                }
+                choice = model_1.FREE_TIER_PROVIDER;
+                budgetDegraded = true;
+            }
+            const target = !budgetDegraded && risky ? escalationTarget(config, choice) : undefined;
+            if (target) {
+                // Rebuild the shortcut's provider with the stronger model.
+                model = (0, model_1.buildProvider)({ ...(0, model_1.providerChoiceConfig)(choice), model: target, fetchImpl, env });
+                escalated = true;
+                notices.push(`risky paths in this diff — review escalated to ${target}`);
+            }
+            else {
+                model = (0, model_1.selectProvider)(choice, fetchImpl);
+            }
         }
     }
     const tracker = new cost_1.CostTracker(config.tokenCaps);
@@ -33287,12 +33459,14 @@ const engine_1 = __nccwpck_require__(4646);
 const payload_1 = __nccwpck_require__(3356);
 /** The identity the workflow token comments appear under (for self-event skipping). */
 const ACTIONS_BOT_LOGIN = "github-actions[bot]";
-/** review-model choice → the provider API-key env var the engine reads. */
+/** review-model shortcut → the provider API-key env var the engine reads. */
 const PROVIDER_KEY_ENV = {
     gemini: "GEMINI_API_KEY",
     haiku: "ANTHROPIC_API_KEY",
     groq: "GROQ_API_KEY",
 };
+/** Supported LLM API protocols for the `provider` input. */
+const PROTOCOLS = ["openai", "anthropic", "gemini"];
 const SEVERITIES = ["critical", "high", "medium", "low", "nit"];
 /** Read an action input, falling back to an env var so local dev still works. */
 function input(name, envKey) {
@@ -33307,17 +33481,36 @@ async function run() {
     if (!token) {
         throw new Error("no GitHub token — set the `github-token` input or GITHUB_TOKEN env var");
     }
-    // ── Provider selection: review-model picks the provider; llm-api-key is that
-    // provider's key. We set the env vars the engine already reads, so the engine
-    // keeps owning provider construction, budget degrade, and escalation.
-    const modelRaw = (input("review-model", "REVIEW_MODEL") || "haiku").toLowerCase();
-    const model = modelRaw in PROVIDER_KEY_ENV ? modelRaw : "haiku";
-    if (model !== modelRaw)
-        core.warning(`unknown review-model "${modelRaw}" — falling back to haiku`);
-    process.env.REVIEW_MODEL = model;
+    // ── LLM key: the unified LLM_API_KEY the engine resolves for any provider.
     const apiKey = input("llm-api-key");
     if (apiKey)
-        process.env[PROVIDER_KEY_ENV[model]] = apiKey;
+        process.env.LLM_API_KEY = apiKey;
+    // ── Provider selection. `provider` (the API protocol) drives the unified
+    // scheme when set; otherwise the review-model shortcut path is used. Either
+    // way the engine owns provider construction, budget degrade, and escalation.
+    const providerRaw = input("provider", "PROVIDER").toLowerCase();
+    let provider;
+    let providerModel;
+    let baseUrl;
+    if (providerRaw) {
+        if (!PROTOCOLS.includes(providerRaw)) {
+            throw new Error(`unknown provider "${providerRaw}" — use one of: ${PROTOCOLS.join(" | ")}`);
+        }
+        provider = providerRaw;
+        providerModel = input("model", "LLM_MODEL") || process.env.REVIEW_MODEL_ID || undefined;
+        baseUrl = input("base-url", "LLM_BASE_URL") || undefined;
+    }
+    else {
+        // Back-compat: review-model shortcut. Also set the provider-specific key var.
+        const modelRaw = (input("review-model", "REVIEW_MODEL") || "haiku").toLowerCase();
+        const shortcut = modelRaw in PROVIDER_KEY_ENV ? modelRaw : "haiku";
+        if (shortcut !== modelRaw)
+            core.warning(`unknown review-model "${modelRaw}" — falling back to haiku`);
+        process.env.REVIEW_MODEL = shortcut;
+        if (apiKey)
+            process.env[PROVIDER_KEY_ENV[shortcut]] = apiKey;
+    }
+    const escalationModel = input("escalation-model", "ESCALATION_MODEL") || undefined;
     // ── min-severity: optional publish floor. Validated; an invalid value is
     // ignored so the run falls back to .aireview.toml / the engine default.
     const minSeverityRaw = input("min-severity").toLowerCase();
@@ -33340,10 +33533,14 @@ async function run() {
         minSeverity,
         configPath,
         runLogPath,
-        // Escalation routes risky paths to Anthropic Sonnet, which needs an Anthropic
-        // key. With a single llm-api-key we only have one when review-model is haiku;
-        // otherwise disable escalation so a risky diff can't hard-fail the run.
-        escalation: model === "haiku" ? undefined : false,
+        // Unified provider fields (undefined when using the review-model shortcut).
+        provider,
+        model: providerModel,
+        baseUrl,
+        apiKey: apiKey || undefined,
+        // The engine now decides whether escalation is possible (only the anthropic
+        // protocol / haiku shortcut has a default; other endpoints need this set).
+        escalationModel,
     };
     const result = await (0, engine_1.runReview)({
         owner: github.context.repo.owner,

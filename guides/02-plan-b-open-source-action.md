@@ -49,23 +49,27 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: anshace/loupe@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Pick ONE provider and set its key as a repo secret:
-          ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}   # Claude Haiku 4.5 (quality default)
-          # GEMINI_API_KEY: ${{ secrets.LLM_API_KEY }}    # or: Gemini 2.5 Flash (free tier)
-          # GROQ_API_KEY: ${{ secrets.LLM_API_KEY }}      # or: Groq Llama (free fallback)
-          REVIEW_MODEL: haiku   # haiku | gemini | groq — must match the key you set above
+        with:
+          llm-api-key: ${{ secrets.LLM_API_KEY }}
+          provider: anthropic          # openai | anthropic | gemini
+          model: claude-haiku-4-5
 ```
 
-That's it. `GITHUB_TOKEN` is auto-provided by Actions with the
-`permissions:` block above; the LLM key is the one secret the consumer adds
-themselves. The engine already reads `REVIEW_MODEL`, `ANTHROPIC_API_KEY`,
-`GEMINI_API_KEY`, and `GROQ_API_KEY` directly from the environment
-(`packages/engine/src/model.ts` — `resolveProviderChoice`, and each
-provider's `complete()`), so this is real, working wiring today — the only
-missing piece is the Action manifest that lets `uses: anshace/loupe@v1`
-resolve to it at all (next section).
+That's it. `github-token` defaults to the Actions token (the `permissions:`
+block above scopes it); the LLM key is the one secret the consumer adds
+themselves.
+
+**Any provider works.** `provider` selects the API *protocol*: `openai` is any
+OpenAI-compatible `/chat/completions` endpoint (OpenAI, OpenRouter, DeepSeek,
+Together, Groq, local/Ollama — set `base-url` + `model`), `anthropic` is any
+`/v1/messages` endpoint, and `gemini` is Google AI Studio. Free $0/mo paths are
+Gemini and Groq. The full protocol/base-url/model/key table plus copy-paste
+examples (and the env/secret form) live in the
+[README → Model providers](../README.md#model-providers) section — this is real
+wiring today (`packages/engine/src/model.ts` — `buildProvider`, and each
+provider's `complete()`); the only missing piece is the Action manifest that
+lets `uses: anshace/loupe@v1` resolve to it (next section). Leaving `provider`
+empty falls back to the older `review-model: haiku | gemini | groq` shortcut.
 
 Optional per-repo tuning (`.aireview.toml`, `HOUSE_RULES.md`) is documented in
 [guide 04](./04-how-to-run-and-test.md#where-to-look-when-tuning).

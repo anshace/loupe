@@ -76,7 +76,17 @@ describe("MockProvider", () => {
   });
 });
 
-import { AnthropicProvider, GroqProvider, resolveProviderChoice, selectProvider, GeminiFlashProvider as Gemini } from "./model";
+import {
+  AnthropicProvider,
+  GroqProvider,
+  OpenAICompatibleProvider,
+  OPENAI_COMPATIBLE_PRESETS,
+  buildProvider,
+  resolveOpenAIBaseUrl,
+  resolveProviderChoice,
+  selectProvider,
+  GeminiFlashProvider as Gemini,
+} from "./model";
 
 const ANTHROPIC_RESPONSE = JSON.stringify({
   content: [{ type: "text", text: "[]" }],
@@ -184,9 +194,219 @@ describe("provider selection", () => {
     expect(resolveProviderChoice({ REVIEW_MODEL: "gpt-99" })).toBe("haiku");
   });
 
-  it("constructs the matching provider", () => {
+  it("constructs the matching provider (groq maps onto the OpenAI-compatible protocol)", () => {
     expect(selectProvider("haiku")).toBeInstanceOf(AnthropicProvider);
-    expect(selectProvider("groq")).toBeInstanceOf(GroqProvider);
     expect(selectProvider("gemini")).toBeInstanceOf(Gemini);
+    const groq = selectProvider("groq");
+    expect(groq).toBeInstanceOf(OpenAICompatibleProvider);
+    expect(groq.name).toBe("llama-3.3-70b-versatile");
+  });
+});
+
+const OPENAI_RESPONSE = JSON.stringify({
+  choices: [{ message: { content: '[{"severity":"medium"}]' } }],
+  usage: { prompt_tokens: 42, completion_tokens: 7 },
+});
+
+describe("OpenAICompatibleProvider", () => {
+  it("POSTs baseUrl + /chat/completions with a bearer key and parses content + usage", async () => {
+    const calls: Array<{ url: string; init?: Parameters<FetchLike>[1] }> = [];
+    const fake: FetchLike = async (url, init) => {
+      calls.push({ url, init });
+      return { ok: true, status: 200, text: async () => OPENAI_RESPONSE };
+    };
+    const provider = new OpenAICompatibleProvider({
+      baseUrl: "https://api.openai.com/v1",
+      model: "gpt-4o-mini",
+      apiKey: "sk-test",
+      fetchImpl: fake,
+    });
+
+    const res = await provider.complete({ system: "sys", user: "usr" });
+
+    expect(provider.name).toBe("gpt-4o-mini");
+    expect(res).toEqual({ text: '[{"severity":"medium"}]', inputTokens: 42, outputTokens: 7 });
+    expect(calls[0].url).toBe("https://api.openai.com/v1/chat/completions");
+    expect(calls[0].init?.headers?.authorization).toBe("Bearer sk-test");
+    const body = JSON.parse(calls[0].init?.body ?? "{}");
+    expect(body.model).toBe("gpt-4o-mini");
+    expect(body.messages).toEqual([
+      { role: "system", content: "sys" },
+      { role: "user", content: "usr" },
+    ]);
+    // response_format is ON by default.
+    expect(body.response_format).toEqual({ type: "json_object" });
+  });
+
+  it("omits response_format when disabled and normalizes a trailing-slash bare-host baseUrl", async () => {
+    const calls: Array<{ url: string; init?: Parameters<FetchLike>[1] }> = [];
+    const fake: FetchLike = async (url, init) => {
+      calls.push({ url, init });
+      return { ok: true, status: 200, text: async () => OPENAI_RESPONSE };
+    };
+    const provider = new OpenAICompatibleProvider({
+      baseUrl: "https://api.deepseek.com/", // trailing slash, no /v1
+      model: "deepseek-chat",
+      apiKey: "k",
+      responseFormat: false,
+      fetchImpl: fake,
+    });
+
+    await provider.complete({ system: "s", user: "u" });
+
+    // Trailing slash stripped; /v1 is NOT forced.
+    expect(calls[0].url).toBe("https://api.deepseek.com/chat/completions");
+    const body = JSON.parse(calls[0].init?.body ?? "{}");
+    expect(body.response_format).toBeUndefined();
+  });
+
+  it("sends extra headers and falls back to LLM_API_KEY at call time", async () => {
+    const prev = process.env.LLM_API_KEY;
+    process.env.LLM_API_KEY = "env-key";
+    try {
+      const calls: Array<{ url: string; init?: Parameters<FetchLike>[1] }> = [];
+      const fake: FetchLike = async (url, init) => {
+        calls.push({ url, init });
+        return { ok: true, status: 200, text: async () => OPENAI_RESPONSE };
+      };
+      const provider = new OpenAICompatibleProvider({
+        baseUrl: "https://openrouter.ai/api/v1",
+        model: "deepseek/deepseek-chat",
+        extraHeaders: { "HTTP-Referer": "https://example.com" },
+        fetchImpl: fake,
+      });
+      await provider.complete({ system: "s", user: "u" });
+      expect(calls[0].init?.headers?.authorization).toBe("Bearer env-key");
+      expect(calls[0].init?.headers?.["HTTP-Referer"]).toBe("https://example.com");
+    } finally {
+      if (prev !== undefined) process.env.LLM_API_KEY = prev;
+      else delete process.env.LLM_API_KEY;
+    }
+  });
+
+  it("throws naming the configured env var when no key is available", async () => {
+    const prev = process.env.LLM_API_KEY;
+    delete process.env.LLM_API_KEY;
+    try {
+      const provider = new OpenAICompatibleProvider({
+        baseUrl: "https://api.openai.com/v1",
+        model: "gpt-4o-mini",
+        fetchImpl: async () => ({ ok: true, status: 200, text: async () => "{}" }),
+      });
+      await expect(provider.complete({ system: "s", user: "u" })).rejects.toThrow(/LLM_API_KEY/);
+    } finally {
+      if (prev !== undefined) process.env.LLM_API_KEY = prev;
+    }
+  });
+});
+
+describe("resolveOpenAIBaseUrl", () => {
+  it("resolves preset keywords to URLs", () => {
+    expect(resolveOpenAIBaseUrl("openai")).toBe("https://api.openai.com/v1");
+    expect(resolveOpenAIBaseUrl("openrouter")).toBe("https://openrouter.ai/api/v1");
+    expect(resolveOpenAIBaseUrl("groq")).toBe("https://api.groq.com/openai/v1");
+    expect(resolveOpenAIBaseUrl("deepseek")).toBe("https://api.deepseek.com");
+    expect(resolveOpenAIBaseUrl("together")).toBe("https://api.together.xyz/v1");
+    expect(resolveOpenAIBaseUrl(undefined)).toBe(OPENAI_COMPATIBLE_PRESETS.openai);
+  });
+
+  it("uses a full http(s) URL verbatim (trailing slash stripped)", () => {
+    expect(resolveOpenAIBaseUrl("http://localhost:11434/v1")).toBe("http://localhost:11434/v1");
+    expect(resolveOpenAIBaseUrl("https://my-host.example/api/")).toBe("https://my-host.example/api");
+  });
+
+  it("throws on an unknown keyword", () => {
+    expect(() => resolveOpenAIBaseUrl("not-a-preset")).toThrow(/unknown base-url/);
+  });
+});
+
+describe("AnthropicProvider baseUrl override", () => {
+  it("targets ${baseUrl}/v1/messages", async () => {
+    const calls: string[] = [];
+    const fake: FetchLike = async (url) => {
+      calls.push(url);
+      return { ok: true, status: 200, text: async () => ANTHROPIC_RESPONSE };
+    };
+    const provider = new AnthropicProvider({
+      apiKey: "k",
+      baseUrl: "https://anthropic.example.com/proxy/",
+      fetchImpl: fake,
+    });
+    await provider.complete({ system: "s", user: "u" });
+    expect(calls[0]).toBe("https://anthropic.example.com/proxy/v1/messages");
+  });
+});
+
+describe("buildProvider", () => {
+  const noKeyEnv: Record<string, string | undefined> = {};
+
+  it("builds the gemini protocol with its default model", () => {
+    const m = buildProvider({ provider: "gemini", env: { GEMINI_API_KEY: "k" } });
+    expect(m).toBeInstanceOf(Gemini);
+    expect(m.name).toBe("gemini-2.5-flash");
+  });
+
+  it("builds the anthropic protocol with its default model", () => {
+    const m = buildProvider({ provider: "anthropic", env: { ANTHROPIC_API_KEY: "k" } });
+    expect(m).toBeInstanceOf(AnthropicProvider);
+    expect(m.name).toBe("claude-haiku-4-5");
+  });
+
+  it("builds the openai protocol, resolving a preset base-url", async () => {
+    const calls: string[] = [];
+    const fake: FetchLike = async (url) => {
+      calls.push(url);
+      return { ok: true, status: 200, text: async () => OPENAI_RESPONSE };
+    };
+    const m = buildProvider({
+      provider: "openai",
+      baseUrl: "openrouter",
+      model: "deepseek/deepseek-chat",
+      apiKey: "k",
+      fetchImpl: fake,
+    });
+    expect(m).toBeInstanceOf(OpenAICompatibleProvider);
+    await m.complete({ system: "s", user: "u" });
+    expect(calls[0]).toBe("https://openrouter.ai/api/v1/chat/completions");
+  });
+
+  it("throws when the openai protocol has no model", () => {
+    expect(() => buildProvider({ provider: "openai", env: noKeyEnv })).toThrow(/requires an explicit model/);
+  });
+
+  it("resolves apiKey via LLM_API_KEY then provider-specific vars", async () => {
+    // explicit apiKey wins
+    const explicit = buildProvider({
+      provider: "openai",
+      model: "x",
+      apiKey: "explicit",
+      env: { LLM_API_KEY: "unified", OPENAI_API_KEY: "specific" },
+      fetchImpl: async () => ({ ok: true, status: 200, text: async () => OPENAI_RESPONSE }),
+    });
+    // LLM_API_KEY over the provider-specific var
+    let seen = "";
+    const capture: FetchLike = async (_url, init) => {
+      seen = String(init?.headers?.authorization);
+      return { ok: true, status: 200, text: async () => OPENAI_RESPONSE };
+    };
+    const unified = buildProvider({
+      provider: "openai",
+      model: "x",
+      env: { LLM_API_KEY: "unified", OPENAI_API_KEY: "specific" },
+      fetchImpl: capture,
+    });
+    await unified.complete({ system: "s", user: "u" });
+    expect(seen).toBe("Bearer unified");
+
+    // provider-specific var when LLM_API_KEY is absent
+    const specific = buildProvider({
+      provider: "openai",
+      model: "x",
+      env: { OPENROUTER_API_KEY: "or-key" },
+      fetchImpl: capture,
+    });
+    await specific.complete({ system: "s", user: "u" });
+    expect(seen).toBe("Bearer or-key");
+    expect(explicit).toBeInstanceOf(OpenAICompatibleProvider);
   });
 });

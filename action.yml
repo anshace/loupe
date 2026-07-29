@@ -12,10 +12,34 @@ inputs:
     required: false
     default: ${{ github.token }}
   llm-api-key:
-    description: "API key for the LLM provider selected by review-model (Gemini / Anthropic / Groq). Store it as a repo secret."
+    description: "API key for the chosen provider. Store it as a repo secret. Read as the unified LLM_API_KEY (and, for review-model shortcuts, the provider-specific var)."
     required: true
+  provider:
+    description: >
+      LLM API PROTOCOL (not the vendor): openai | anthropic | gemini.
+      'openai' is ANY OpenAI-compatible /chat/completions endpoint (OpenAI,
+      OpenRouter, DeepSeek, Together, Groq, local/Ollama) — set base-url + model.
+      'anthropic' is any Anthropic /v1/messages endpoint. 'gemini' is Google AI
+      Studio. Leave empty to use the review-model back-compat shortcut instead.
+    required: false
+    default: ""
+  model:
+    description: "Model id for the chosen provider (e.g. gpt-4o-mini, deepseek/deepseek-chat, claude-haiku-4-5, gemini-2.5-flash). Required when provider=openai."
+    required: false
+    default: ""
+  base-url:
+    description: >
+      For provider=openai: a preset keyword (openai | openrouter | groq |
+      deepseek | together) or a full http(s):// URL (e.g. an Ollama endpoint).
+      For anthropic/gemini: optional endpoint override. Ignored by review-model.
+    required: false
+    default: ""
+  escalation-model:
+    description: "Stronger model for risky diffs (auth/payment/migration/etc). Rebuilds the same provider with this model. Anthropic defaults to claude-sonnet-5 when unset; other endpoints don't escalate without it."
+    required: false
+    default: ""
   review-model:
-    description: "Which model to review with: gemini | haiku | groq."
+    description: "Back-compat alias (used only when `provider` is empty): gemini | haiku | groq."
     required: false
     default: "haiku"
   min-severity:

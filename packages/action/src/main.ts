@@ -17,12 +17,15 @@ import { extractPrEventInfo, toRunEvent } from "./payload";
 /** The identity the workflow token comments appear under (for self-event skipping). */
 const ACTIONS_BOT_LOGIN = "github-actions[bot]";
 
-/** review-model choice → the provider API-key env var the engine reads. */
+/** review-model shortcut → the provider API-key env var the engine reads. */
 const PROVIDER_KEY_ENV: Record<string, string> = {
   gemini: "GEMINI_API_KEY",
   haiku: "ANTHROPIC_API_KEY",
   groq: "GROQ_API_KEY",
 };
+
+/** Supported LLM API protocols for the `provider` input. */
+const PROTOCOLS: readonly string[] = ["openai", "anthropic", "gemini"];
 
 const SEVERITIES: readonly string[] = ["critical", "high", "medium", "low", "nit"];
 
@@ -41,15 +44,35 @@ async function run(): Promise<void> {
     throw new Error("no GitHub token — set the `github-token` input or GITHUB_TOKEN env var");
   }
 
-  // ── Provider selection: review-model picks the provider; llm-api-key is that
-  // provider's key. We set the env vars the engine already reads, so the engine
-  // keeps owning provider construction, budget degrade, and escalation.
-  const modelRaw = (input("review-model", "REVIEW_MODEL") || "haiku").toLowerCase();
-  const model = modelRaw in PROVIDER_KEY_ENV ? modelRaw : "haiku";
-  if (model !== modelRaw) core.warning(`unknown review-model "${modelRaw}" — falling back to haiku`);
-  process.env.REVIEW_MODEL = model;
+  // ── LLM key: the unified LLM_API_KEY the engine resolves for any provider.
   const apiKey = input("llm-api-key");
-  if (apiKey) process.env[PROVIDER_KEY_ENV[model]] = apiKey;
+  if (apiKey) process.env.LLM_API_KEY = apiKey;
+
+  // ── Provider selection. `provider` (the API protocol) drives the unified
+  // scheme when set; otherwise the review-model shortcut path is used. Either
+  // way the engine owns provider construction, budget degrade, and escalation.
+  const providerRaw = input("provider", "PROVIDER").toLowerCase();
+  let provider: "openai" | "anthropic" | "gemini" | undefined;
+  let providerModel: string | undefined;
+  let baseUrl: string | undefined;
+
+  if (providerRaw) {
+    if (!PROTOCOLS.includes(providerRaw)) {
+      throw new Error(`unknown provider "${providerRaw}" — use one of: ${PROTOCOLS.join(" | ")}`);
+    }
+    provider = providerRaw as "openai" | "anthropic" | "gemini";
+    providerModel = input("model", "LLM_MODEL") || process.env.REVIEW_MODEL_ID || undefined;
+    baseUrl = input("base-url", "LLM_BASE_URL") || undefined;
+  } else {
+    // Back-compat: review-model shortcut. Also set the provider-specific key var.
+    const modelRaw = (input("review-model", "REVIEW_MODEL") || "haiku").toLowerCase();
+    const shortcut = modelRaw in PROVIDER_KEY_ENV ? modelRaw : "haiku";
+    if (shortcut !== modelRaw) core.warning(`unknown review-model "${modelRaw}" — falling back to haiku`);
+    process.env.REVIEW_MODEL = shortcut;
+    if (apiKey) process.env[PROVIDER_KEY_ENV[shortcut]] = apiKey;
+  }
+
+  const escalationModel = input("escalation-model", "ESCALATION_MODEL") || undefined;
 
   // ── min-severity: optional publish floor. Validated; an invalid value is
   // ignored so the run falls back to .aireview.toml / the engine default.
@@ -74,10 +97,14 @@ async function run(): Promise<void> {
     minSeverity,
     configPath,
     runLogPath,
-    // Escalation routes risky paths to Anthropic Sonnet, which needs an Anthropic
-    // key. With a single llm-api-key we only have one when review-model is haiku;
-    // otherwise disable escalation so a risky diff can't hard-fail the run.
-    escalation: model === "haiku" ? undefined : false,
+    // Unified provider fields (undefined when using the review-model shortcut).
+    provider,
+    model: providerModel,
+    baseUrl,
+    apiKey: apiKey || undefined,
+    // The engine now decides whether escalation is possible (only the anthropic
+    // protocol / haiku shortcut has a default; other endpoints need this set).
+    escalationModel,
   };
 
   const result = await runReview(

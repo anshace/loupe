@@ -20,6 +20,7 @@ import {
   GeminiFlashProvider,
   GroqProvider,
   KvStateStore,
+  buildProvider,
   fetchPrDiff,
   resolveProviderChoice,
   runReview,
@@ -38,8 +39,19 @@ export interface WorkerEnv {
   GROQ_API_KEY?: string;
   /** The App's own login (e.g. "my-review-app[bot]") for self-event skipping. */
   BOT_LOGIN?: string;
-  /** Provider choice: haiku (default) | gemini | groq. */
+  /** Back-compat provider shortcut (used when PROVIDER is unset): haiku | gemini | groq. */
   REVIEW_MODEL?: string;
+  /**
+   * Unified provider scheme (mirrors the Action): PROVIDER is the API protocol
+   * (openai | anthropic | gemini). When set, LLM_MODEL / LLM_BASE_URL /
+   * LLM_API_KEY / ESCALATION_MODEL configure it and the engine owns provider
+   * construction (budget degrade + escalation). Absent → REVIEW_MODEL shortcut.
+   */
+  PROVIDER?: string;
+  LLM_MODEL?: string;
+  LLM_BASE_URL?: string;
+  LLM_API_KEY?: string;
+  ESCALATION_MODEL?: string;
   /**
    * Cloudflare KV binding for M5 per-PR state (task 7.1) — see wrangler.toml.
    * Optional: absent → stateless mode. Typed as the engine's minimal KvLike
@@ -60,8 +72,20 @@ export interface HandlerDeps {
 /**
  * Build the provider with keys from Worker env vars — the engine's default
  * constructors read process.env, which does not exist in the Workers runtime.
+ * When PROVIDER is set, use the unified scheme; otherwise the REVIEW_MODEL
+ * shortcut (used directly by /ask, which needs a concrete model in hand).
  */
 export function buildModel(env: WorkerEnv, fetchImpl: FetchLike): ReviewModel {
+  if (env.PROVIDER) {
+    return buildProvider({
+      provider: env.PROVIDER as "openai" | "anthropic" | "gemini",
+      model: env.LLM_MODEL,
+      baseUrl: env.LLM_BASE_URL,
+      apiKey: env.LLM_API_KEY,
+      fetchImpl,
+      env: env as unknown as Record<string, string | undefined>,
+    });
+  }
   const choice = resolveProviderChoice({ REVIEW_MODEL: env.REVIEW_MODEL });
   switch (choice) {
     case "gemini":
@@ -73,13 +97,29 @@ export function buildModel(env: WorkerEnv, fetchImpl: FetchLike): ReviewModel {
   }
 }
 
+/** Unified provider fields for the EngineConfig, when PROVIDER is set. */
+function providerConfig(env: WorkerEnv): Partial<EngineConfig> {
+  if (!env.PROVIDER) return {};
+  return {
+    provider: env.PROVIDER as "openai" | "anthropic" | "gemini",
+    model: env.LLM_MODEL,
+    baseUrl: env.LLM_BASE_URL,
+    apiKey: env.LLM_API_KEY,
+    escalationModel: env.ESCALATION_MODEL,
+  };
+}
+
 function engineDeps(env: WorkerEnv, deps: HandlerDeps): { fetchImpl: FetchLike; runDeps: RunDeps } {
   const fetchImpl = deps.fetchImpl ?? fetch;
+  // Unified scheme: let the engine construct the provider from EngineConfig +
+  // env so budget degrade + escalation apply. Back-compat: inject the model
+  // built from the specific env keys (Workers has no process.env to fall back on).
+  const model = deps.model ?? (env.PROVIDER ? undefined : buildModel(env, fetchImpl));
   return {
     fetchImpl,
     runDeps: {
       fetchImpl,
-      model: deps.model ?? buildModel(env, fetchImpl),
+      model,
       // No filesystem on Workers — inject the build-time-embedded template.
       promptTemplate: REVIEWER_PROMPT_TEMPLATE,
       env: env as unknown as Record<string, string | undefined>,
@@ -99,7 +139,11 @@ export async function handleReviewDispatch(
   const { runDeps } = engineDeps(env, deps);
   const review = deps.review ?? runReview;
   const token = await tokens.getToken(dispatch.installationId);
-  const config: EngineConfig = { event: dispatch.event, botIdentity: env.BOT_LOGIN };
+  const config: EngineConfig = {
+    event: dispatch.event,
+    botIdentity: env.BOT_LOGIN,
+    ...providerConfig(env),
+  };
   return review(dispatch.pr, token, config, runDeps);
 }
 
@@ -156,7 +200,8 @@ export async function handleCommandDispatch(
   await addEyesReaction(dispatch.pr, dispatch.commentId, token, fetchImpl);
 
   if (dispatch.command === "ask") {
-    const model = runDeps.model as ReviewModel; // engineDeps always sets one
+    // engineDeps only injects a model in back-compat mode; build one otherwise.
+    const model = (runDeps.model as ReviewModel | undefined) ?? buildModel(env, fetchImpl);
     await answerAsk(dispatch.pr, dispatch.argument, token, model, fetchImpl);
     return undefined;
   }
@@ -172,6 +217,7 @@ export async function handleCommandDispatch(
       onDemand: true,
     },
     botIdentity: env.BOT_LOGIN,
+    ...providerConfig(env),
   };
   const review = deps.review ?? runReview;
   return review(dispatch.pr, token, config, runDeps);

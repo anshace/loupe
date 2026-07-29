@@ -28,7 +28,8 @@ jobs:
       - uses: anshace/loupe@v1
         with:
           llm-api-key: ${{ secrets.LLM_API_KEY }}
-          review-model: haiku          # gemini | haiku | groq
+          provider: anthropic          # openai | anthropic | gemini (see below)
+          model: claude-haiku-4-5
           # min-severity: medium       # critical | high | medium | low | nit
           # config-path: .aireview.toml
           # state-path: .aireview-state.json   # persist via actions/cache for incremental re-review
@@ -39,11 +40,109 @@ Add your provider key as a repository secret named `LLM_API_KEY`
 (Settings → Secrets and variables → Actions). `github-token` defaults to the
 workflow token, so you don't need to set it.
 
-**Which key?** `review-model: gemini` uses a **free** Google AI Studio key
-(<https://aistudio.google.com/apikey>) — the $0/mo path. `review-model: haiku`
-(the default) uses an Anthropic API key (<https://console.anthropic.com>) for
-higher-quality reviews and enables risky-path escalation to a stronger model.
-`groq` is a free Llama fallback.
+## Model providers
+
+Loupe works with **any** OpenAI-API-compatible endpoint, any Anthropic endpoint,
+and Gemini. `provider` selects the API **protocol** (not the vendor):
+
+- `openai` — any OpenAI-compatible `/chat/completions` endpoint. Set `base-url`
+  (a preset keyword or a full URL) and `model`. Covers OpenAI, OpenRouter,
+  DeepSeek, Together, Groq, and local runtimes like Ollama.
+- `anthropic` — any Anthropic `/v1/messages` endpoint. `base-url` optional.
+- `gemini` — Google AI Studio. `base-url` optional.
+
+`base-url` accepts a preset keyword or a full `http(s)://` URL:
+
+| Protocol | Example provider | `base-url` | `model` | Key source |
+|----------|------------------|-----------|---------|------------|
+| `openai` | OpenAI | `openai` | `gpt-4o-mini` | OpenAI key |
+| `openai` | OpenRouter | `openrouter` | `deepseek/deepseek-chat` | OpenRouter key |
+| `openai` | Groq (**free**) | `groq` | `llama-3.3-70b-versatile` | Groq key |
+| `openai` | DeepSeek | `deepseek` | `deepseek-chat` | DeepSeek key |
+| `openai` | Together | `together` | `meta-llama/Llama-3.3-70B-Instruct-Turbo` | Together key |
+| `openai` | Ollama (local) | `http://localhost:11434/v1` | your local model | any (unused) |
+| `anthropic` | Anthropic | *(default)* | `claude-haiku-4-5` | Anthropic key |
+| `gemini` | Google AI Studio (**free**) | *(default)* | `gemini-2.5-flash` | Gemini key |
+
+**$0/mo options:** `gemini` (Google AI Studio free tier) and `groq` (free Llama).
+
+### Copy-paste examples
+
+```yaml
+# OpenAI — gpt-4o-mini
+with:
+  llm-api-key: ${{ secrets.LLM_API_KEY }}
+  provider: openai
+  model: gpt-4o-mini
+```
+
+```yaml
+# OpenRouter — any model (here DeepSeek)
+with:
+  llm-api-key: ${{ secrets.LLM_API_KEY }}
+  provider: openai
+  base-url: openrouter
+  model: deepseek/deepseek-chat
+```
+
+```yaml
+# Groq — free Llama
+with:
+  llm-api-key: ${{ secrets.LLM_API_KEY }}
+  provider: openai
+  base-url: groq
+  model: llama-3.3-70b-versatile
+```
+
+```yaml
+# Anthropic Haiku (enables risky-path escalation to claude-sonnet-5 by default)
+with:
+  llm-api-key: ${{ secrets.LLM_API_KEY }}
+  provider: anthropic
+  model: claude-haiku-4-5
+  # escalation-model: claude-sonnet-5   # override; or set on any provider to enable escalation
+```
+
+```yaml
+# Gemini — free
+with:
+  llm-api-key: ${{ secrets.LLM_API_KEY }}
+  provider: gemini
+  model: gemini-2.5-flash
+```
+
+You can also configure everything from **env/secrets** instead of `with:` inputs
+— handy for local dev or matrix workflows. The env fallbacks are `PROVIDER`,
+`LLM_MODEL`, `LLM_BASE_URL`, `LLM_API_KEY`, and `ESCALATION_MODEL`:
+
+```yaml
+- uses: anshace/loupe@v1
+  env:
+    PROVIDER: openai
+    LLM_BASE_URL: openrouter
+    LLM_MODEL: deepseek/deepseek-chat
+    LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+```
+
+### Escalation
+
+For any provider, set `escalation-model` to route risky diffs
+(auth/payment/migration/…) to a stronger model — Loupe rebuilds the **same**
+provider/base-url/key with that model. The `anthropic` protocol defaults to
+`claude-sonnet-5` when `escalation-model` is unset; other endpoints don't
+escalate unless you set it (Loupe can't guess a stronger model for an arbitrary
+endpoint).
+
+### Back-compat shortcut
+
+Leaving `provider` empty falls back to the `review-model` shortcut
+(`gemini | haiku | groq`), the older single-input form:
+
+```yaml
+with:
+  llm-api-key: ${{ secrets.LLM_API_KEY }}
+  review-model: haiku          # gemini | haiku | groq
+```
 
 ## Repository layout
 

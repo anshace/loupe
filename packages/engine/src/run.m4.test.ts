@@ -236,7 +236,7 @@ describe("runReview — risk-based escalation (6.5)", () => {
     };
   }
 
-  function escalationDeps(): RunDeps {
+  function escalationDeps(reviewModel = "haiku"): RunDeps {
     return {
       fetchImpl: routedFetch(),
       repoFiles: {},
@@ -244,18 +244,36 @@ describe("runReview — risk-based escalation (6.5)", () => {
       headFiles: {},
       post: async () => {},
       upsertSummary: async () => {},
-      env: { REVIEW_MODEL: "gemini", ANTHROPIC_API_KEY: "k", GEMINI_API_KEY: "k" },
+      env: { REVIEW_MODEL: reviewModel, ANTHROPIC_API_KEY: "k", GEMINI_API_KEY: "k" },
     };
   }
 
-  it("escalates risky paths to claude-sonnet-5 with a notice", async () => {
-    const result = await runReview(pr, "tok", {}, escalationDeps());
+  it("escalates risky paths to the claude-sonnet-5 anthropic default with a notice", async () => {
+    // haiku shortcut → anthropic protocol → Sonnet default.
+    const result = await runReview(pr, "tok", {}, escalationDeps("haiku"));
     expect(result.usage?.model).toBe("claude-sonnet-5");
     expect(result.notices.join(" ")).toContain("escalated to claude-sonnet-5");
   });
 
-  it("respects the escalation: false override", async () => {
-    const result = await runReview(pr, "tok", { escalation: false }, escalationDeps());
+  it("does not escalate a non-anthropic shortcut without an escalation model", async () => {
+    // gemini shortcut has no guessable stronger model → stays on gemini.
+    const result = await runReview(pr, "tok", {}, escalationDeps("gemini"));
     expect(result.usage?.model).toBe("gemini-2.5-flash");
+  });
+
+  it("escalates any provider when escalationModel is set (same-provider rebuild)", async () => {
+    const result = await runReview(
+      pr,
+      "tok",
+      { provider: "anthropic", escalationModel: "claude-opus-4-8" },
+      { ...escalationDeps("haiku"), env: { ANTHROPIC_API_KEY: "k" } },
+    );
+    expect(result.usage?.model).toBe("claude-opus-4-8");
+    expect(result.notices.join(" ")).toContain("escalated to claude-opus-4-8");
+  });
+
+  it("respects the escalation: false override", async () => {
+    const result = await runReview(pr, "tok", { escalation: false }, escalationDeps("haiku"));
+    expect(result.usage?.model).toBe("claude-haiku-4-5");
   });
 });
