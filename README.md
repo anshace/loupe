@@ -9,8 +9,7 @@ by Ansh Roshan as a learning-first, real project.
 |------|---------|
 | `openspec/` | Source of truth — spec-driven changes (proposal → specs → design → tasks) |
 | `research/` | Research: competitor repos, product landscape, GitHub integration mechanics, RAG strategies, stack & cost analysis, synthesis + milestones |
-| `documentation/` | Team-facing documentation (English) |
-| `docs/` | Personal notes |
+| `docs/` | Personal notes (solo project — no separate team docs) |
 | `src/` | Implementation (created during `/opsx:apply`) |
 
 ## Where to start
