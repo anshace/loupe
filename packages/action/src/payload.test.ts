@@ -31,6 +31,17 @@ describe("extractPrEventInfo", () => {
     expect(() => extractPrEventInfo(broken)).toThrow(/head\.sha/);
   });
 
+  it("extracts the top-level before SHA on synchronize (incremental scoping, 7.2)", () => {
+    const sync = JSON.parse(JSON.stringify(fixture));
+    sync.action = "synchronize";
+    sync.before = "0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa";
+    const info = extractPrEventInfo(sync);
+    expect(info.before).toBe("0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa");
+    expect(toRunEvent(info).before).toBe("0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa");
+    // opened events have no before → undefined, never a crash
+    expect(extractPrEventInfo(fixture).before).toBeUndefined();
+  });
+
   it("reads draft: true and tolerates a missing sender", () => {
     const draft = JSON.parse(JSON.stringify(fixture));
     draft.pull_request.draft = true;

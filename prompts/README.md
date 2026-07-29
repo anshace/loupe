@@ -22,6 +22,11 @@ Versions:
 - `reviewer-v2.md` — M2: adds the do-not-report list and the `{{HOUSE_RULES}}`
   block.
 - `reviewer-v3.md` — M4: adds the `{{CONTEXT}}` enclosing-scope block and the
-  `{{TOOLS}}` capped agentic-tool protocol. **Current engine default.**
+  `{{TOOLS}}` capped agentic-tool protocol.
+- `reviewer-v4.md` — M5: adds the `{{CUSTOM_RULES}}` block (path-scoped
+  `.aireview.toml` rules, task 7.4) and the `{{RETRIEVED_CONTEXT}}` block
+  (optional RAG experiment, task 7.6 — "(none)" unless the `rag` flag is on).
+  v3 was left untouched per the never-edit-shipped rule. **Current engine
+  default.**
 - `verifier-v1.md` — M4: adversarial verifier — keep/rewrite/drop per finding
   with cited `file:line` evidence and the closed drop-reason enum.

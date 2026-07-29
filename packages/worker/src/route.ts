@@ -84,6 +84,8 @@ function mapPullRequest(payload: Obj): WebhookDispatch {
       actor: str(obj(payload.sender)?.login),
       headSha,
       onDemand: false,
+      // Present on synchronize only — the incremental compare base (7.2).
+      before: str(payload.before),
     },
   };
 }

@@ -1,12 +1,17 @@
 /**
- * The full M4 review pipeline:
- *   gate (draft/bot-actor/same-SHA) → repo config (.aireview.toml at head) →
- *   diff fetch/parse → ignore-globs + noise filter + size cap →
- *   enclosing-scope context (6.1) → provider selection + risk escalation (6.5) →
- *   reviewer (reviewer-v3, optional capped agentic tool loop, 6.3) →
+ * The full M5 review pipeline:
+ *   prior state (StateStore → summary-marker fallback, 7.1) →
+ *   gate (draft/bot-actor/same-SHA) → repo config (.aireview.toml at head,
+ *   incl. custom rules 7.4) → incremental scope decision (before..after
+ *   compare, 7.2) → diff fetch/parse → already-reviewed hunk-hash skip (7.2)
+ *   → ignore-globs + noise filter + size cap → enclosing-scope context (6.1)
+ *   + optional retrieved context (7.6) → provider selection + risk escalation
+ *   (6.5) → reviewer (reviewer-v4, optional capped agentic tool loop, 6.3) →
  *   JSON guardrail → verifier pass (6.4, fail-open, optional) →
  *   suppression filter → anchoring chain → stateless dedupe →
- *   ONE batched review + ONE upserted summary comment (marker + state SHA).
+ *   still-open carry-forward (7.3) →
+ *   ONE batched review + ONE upserted summary comment (marker + state SHA) →
+ *   persist new PR state (7.1) + append run-log record (7.5).
  * Reviewer, verifier, and agentic hops share ONE per-run cost cap (6.6):
  * when it would be exceeded, verifier/agentic work is skipped with a summary
  * disclosure — never a hard failure.
@@ -25,6 +30,7 @@ import {
   AIREVIEW_CONFIG_PATH,
   DEFAULT_REPO_CONFIG,
   HOUSE_RULES_PATH,
+  applicableRules,
   fetchRepoFile,
   globMatch,
   parseAireviewToml,
@@ -37,6 +43,20 @@ import type { FetchLike } from "./diff";
 import { fetchPrDiff, parseUnifiedDiff } from "./diff";
 import { ESCALATION_MODEL, shouldEscalate } from "./escalate";
 import { shouldRun } from "./gate";
+import { decideScope, dropReviewedHunks, fetchCompareDiff } from "./incremental";
+import type { Retriever } from "./retrieve";
+import { DEFAULT_RETRIEVAL_TOP_K, buildRetrievalQuery, renderRetrievedContext } from "./retrieve";
+import type { RunLogIo } from "./runlog";
+import { appendRunLog } from "./runlog";
+import type { PrState, StateStore } from "./state";
+import {
+  MAX_OPEN_FINDINGS,
+  MAX_TRACKED_HUNK_HASHES,
+  carryForwardOpenFindings,
+  hashHunks,
+  mergeFindings,
+  prStateKey,
+} from "./state";
 import { parseModelFindings, parseToolCalls } from "./guardrail";
 import type { ReviewModel } from "./model";
 import { AnthropicProvider, FREE_TIER_PROVIDER, resolveProviderChoice, selectProvider } from "./model";
@@ -106,6 +126,16 @@ export interface RunDeps {
   ledgerIo?: LedgerIo;
   /** Clock (tests). */
   now?: () => Date;
+  /**
+   * Durable per-PR state (task 7.1): KvStateStore on the Worker path,
+   * FileStateStore on the Action path. Absent → stateless mode (the summary
+   * marker remains the only, SHA-only state source).
+   */
+  stateStore?: StateStore;
+  /** Run-log file IO overrides (tests). */
+  runLogIo?: RunLogIo;
+  /** Retrieval implementation for the RAG experiment (task 7.6, packages/rag). */
+  retriever?: Retriever;
 }
 
 export interface SummaryParts {
@@ -165,6 +195,7 @@ function emptyResult(reason: string): ReviewResult {
     skipped: { reason },
     suppressed: [],
     deduped: [],
+    stillOpen: [],
     summaryFindings: [],
     notices: [],
     earlyStop: false,
@@ -217,13 +248,25 @@ export async function runReview(
     deps.existingComments ?? (await fetchExistingComments(pr, auth, fetchImpl, config.botIdentity));
   const existingSummary = findSummaryComment(existing.issueComments);
 
+  // ── Durable state (7.1): store first, summary-marker SHA as the fallback.
+  const stateKey = prStateKey(pr);
+  let priorState: PrState | null = null;
+  if (deps.stateStore) {
+    try {
+      priorState = await deps.stateStore.get(stateKey);
+    } catch {
+      priorState = null; // state reads must never crash a run
+    }
+  }
+  const lastReviewedSha = priorState?.lastReviewedSha ?? existingSummary?.state.sha;
+
   // ── Gate (4.5): draft PRs, self-generated events, already-reviewed SHA.
   const gate = shouldRun({
     isDraft: config.event?.isDraft,
     actor: config.event?.actor,
     botIdentity: config.botIdentity,
     headSha: config.event?.headSha,
-    lastReviewedSha: existingSummary?.state.sha,
+    lastReviewedSha,
     onDemand: config.event?.onDemand,
   });
   if (!gate.run) return emptyResult(gate.reason);
@@ -242,11 +285,47 @@ export async function runReview(
   }
   const minSeverity = config.minSeverity ?? repoConfig.minSeverity;
 
-  // ── Diff → ignore globs → noise filter → size caps.
-  const diffText = await fetchPrDiff(pr, auth, fetchImpl);
-  const files = parseUnifiedDiff(diffText);
+  // ── Incremental scope (7.2): before..after compare when a prior review is
+  // known and the event carries a before SHA; otherwise the full PR diff.
+  const scope = decideScope({
+    before: config.event?.before,
+    headSha: config.event?.headSha,
+    onDemand: config.event?.onDemand,
+    lastReviewedSha,
+  });
+  let diffText: string;
+  let incremental: ReviewResult["incremental"];
+  if (scope.incremental) {
+    try {
+      diffText = await fetchCompareDiff(pr, auth, scope.base, scope.head, fetchImpl);
+      incremental = { base: scope.base, skippedHunks: 0 };
+      notices.push(`incremental review: analyzed only the changes since ${scope.base.slice(0, 7)}`);
+    } catch {
+      // Compare fetch failure must never kill the run — full diff instead.
+      diffText = await fetchPrDiff(pr, auth, fetchImpl);
+      notices.push("incremental compare fetch failed — reviewed the full PR diff");
+    }
+  } else {
+    diffText = await fetchPrDiff(pr, auth, fetchImpl);
+  }
+  let files = parseUnifiedDiff(diffText);
+  // Parsed pre-skip files: the coordinate system for carry-forward (7.3).
+  const changedFiles = files;
 
+  // ── Already-reviewed hunk skip (7.2): content-hash match against state.
+  // Never applied to on-demand runs — /review means "review it again".
   const skipped: SkippedFile[] = [];
+  if (priorState && priorState.hunkHashes.length > 0 && !config.event?.onDemand) {
+    const drop = dropReviewedHunks(files, new Set(priorState.hunkHashes));
+    files = drop.files;
+    if (incremental) incremental.skippedHunks = drop.skippedHunks;
+    for (const file of drop.fullySkippedFiles) skipped.push({ file, reason: "already-reviewed" });
+    if (drop.skippedHunks > 0) {
+      notices.push(`skipped ${drop.skippedHunks} already-reviewed hunk(s) (content unchanged since the last run)`);
+    }
+  }
+
+  // ── Ignore globs → noise filter → size caps.
   const afterIgnore = files.filter((file) => {
     if (repoConfig.ignore.some((glob) => globMatch(glob, file.path))) {
       skipped.push({ file: file.path, reason: "ignored" });
@@ -259,6 +338,7 @@ export async function runReview(
   const { kept, exclusions } = applySizeCap(afterNoise, config.sizeCap);
 
   // ── Provider selection (4.10) + monthly budget degrade (4.11) + escalation (6.5).
+  let escalated = false;
   let model = deps.model;
   if (!model) {
     let choice = resolveProviderChoice(env);
@@ -273,6 +353,7 @@ export async function runReview(
     if (!budgetDegraded && (config.escalation ?? true) && shouldEscalate(kept.map((f) => f.path))) {
       // Risky paths (auth/payment/billing/migration/crypto/secret) → Sonnet.
       model = new AnthropicProvider({ model: ESCALATION_MODEL, fetchImpl });
+      escalated = true;
       notices.push(`risky paths in this diff — review escalated to ${ESCALATION_MODEL}`);
     } else {
       model = selectProvider(choice, fetchImpl);
@@ -333,6 +414,21 @@ export async function runReview(
     const diffText2 = kept.map((f) => f.rawText).join("\n");
     const contextText = context.text || "(none)";
 
+    // ── Custom rules (7.4): only rules whose glob matches a reviewed path.
+    const rules = applicableRules(repoConfig.rules, kept.map((f) => f.path));
+    const customRulesText = rules.length > 0 ? rules.map((r) => `- ${r.text}`).join("\n") : "(none)";
+
+    // ── Optional retrieval (7.6): flag-gated, injected impl, fail-soft.
+    let retrievedText = "(none)";
+    if ((config.rag ?? false) && deps.retriever) {
+      try {
+        const chunks = await deps.retriever.retrieve(buildRetrievalQuery(kept), DEFAULT_RETRIEVAL_TOP_K);
+        retrievedText = renderRetrievedContext(chunks);
+      } catch {
+        notices.push("retrieval failed — continuing without retrieved context");
+      }
+    }
+
     if (!tracker.canProceed()) {
       earlyStop = true;
     } else {
@@ -341,7 +437,9 @@ export async function runReview(
         DIFF: diffText2,
         COMMENTABLE_LINES: formatCommentableLines(kept),
         HOUSE_RULES: houseRules?.trim() ? houseRules.trim() : "(none)",
+        CUSTOM_RULES: customRulesText,
         CONTEXT: contextText,
+        RETRIEVED_CONTEXT: retrievedText,
         TOOLS: toolsText,
       });
 
@@ -444,6 +542,16 @@ export async function runReview(
   const summaryFindings = fresh.filter((a) => a.placement === "summary").map((a) => a.finding);
   const findings = fresh.map((a) => a.finding);
 
+  // ── Still-open carry-forward (7.3). On an incremental run, persisted open
+  // findings whose code the new range did not touch stay open; touched or
+  // deleted code → assumed resolved. Unified with the M2 dedupe path: what
+  // the model re-emitted against an existing comment is also still open.
+  let carried: Finding[] = [];
+  if (incremental && priorState && priorState.openFindings.length > 0) {
+    carried = carryForwardOpenFindings(priorState.openFindings, changedFiles).stillOpen;
+  }
+  const stillOpen = mergeFindings(carried, deduped);
+
   // ── One batched review (body headline + file-level sections + inline comments).
   const reviewBody = buildSummary({
     findings: publishable,
@@ -461,7 +569,7 @@ export async function runReview(
     degraded,
     nothingReviewable,
     summaryFindings,
-    stillOpen: deduped,
+    stillOpen,
     suppressed,
     skippedFiles: skipped,
     exclusions,
@@ -486,6 +594,53 @@ export async function runReview(
     recordSpend(config.ledgerPath, monthKey(now()), tracker.spentUsd, deps.ledgerIo);
   }
 
+  // ── Persist the new PR state (7.1): last-reviewed SHA, cumulative hunk
+  // hashes, and the open-findings set for the next carry-forward. Best-effort
+  // and never on dryRun. Requires a head SHA — state without one is useless.
+  if (deps.stateStore && config.event?.headSha && !config.dryRun) {
+    const priorHashes = incremental ? (priorState?.hunkHashes ?? []) : [];
+    const hunkHashSet = [...new Set([...priorHashes, ...hashHunks(kept)])].slice(-MAX_TRACKED_HUNK_HASHES);
+    try {
+      await deps.stateStore.set(stateKey, {
+        lastReviewedSha: config.event.headSha,
+        hunkHashes: hunkHashSet,
+        openFindings: mergeFindings(findings, stillOpen).slice(0, MAX_OPEN_FINDINGS),
+      });
+    } catch {
+      // State writes are best-effort — never fail a published run.
+    }
+  }
+
+  // ── Run log (7.5): one JSONL record per completed run. The timestamp is
+  // stamped HERE from the injectable clock — the pure core never reads time.
+  if (config.runLogPath) {
+    const dropReasons: Record<string, number> = {};
+    const bump = (reason: string): void => {
+      dropReasons[reason] = (dropReasons[reason] ?? 0) + 1;
+    };
+    for (const s of suppressed) bump(s.reason);
+    for (const _ of deduped) bump("duplicate");
+    for (const d of verification?.dropped ?? []) bump(`verifier:${d.reason}`);
+    appendRunLog(
+      config.runLogPath,
+      {
+        pr: stateKey,
+        timestamp: now().toISOString(),
+        model: usage?.model,
+        inputTokens: usage?.inputTokens ?? 0,
+        outputTokens: usage?.outputTokens ?? 0,
+        estCostUsd: tracker.spentUsd,
+        findingsKept: findings.length,
+        findingsDropped: suppressed.length + deduped.length + (verification?.dropped.length ?? 0),
+        dropReasons,
+        verifierDropped: verification?.dropped.length ?? 0,
+        escalated,
+        incremental: incremental !== undefined,
+      },
+      deps.runLogIo,
+    );
+  }
+
   return {
     findings,
     summary: reviewBody,
@@ -497,6 +652,8 @@ export async function runReview(
     usage,
     suppressed,
     deduped,
+    stillOpen,
+    incremental,
     summaryFindings,
     notices,
     earlyStop,

@@ -70,11 +70,11 @@
 
 ## 7. M5 — Incremental Re-Review
 
-- [ ] 7.1 Implement the state store behind an interface: `{pr → last-reviewed SHA, hunk content-hashes}` on Cloudflare KV for the App path and a flat JSON file for the Action path
-- [ ] 7.2 Implement incremental scoping on `synchronize`: diff only `before..after` from the payload/state so a re-review analyzes just the changes since the last reviewed commit, not the whole PR
-- [ ] 7.3 Implement still-open carry-forward: previously reported unresolved findings listed as "still open" in the upserted summary (resolved ones removed), with inline comments posted only for findings on newly changed code
-- [ ] 7.4 Implement custom rules in `.aireview.toml`: user-written rules injected into the prompt, with per-path rule scoping
-- [ ] 7.5 Implement the run log (PR, model, tokens, cost, findings kept/dropped, drop reasons) written locally per run for self-analytics
-- [ ] 7.6 Optional RAG experiment: sqlite-vec index over house rules/ADRs/past findings, injected as clearly-labeled supplementary context behind a config flag, defaulting off
+- [x] 7.1 Implement the state store behind an interface: `{pr → last-reviewed SHA, hunk content-hashes}` on Cloudflare KV for the App path and a flat JSON file for the Action path
+- [x] 7.2 Implement incremental scoping on `synchronize`: diff only `before..after` from the payload/state so a re-review analyzes just the changes since the last reviewed commit, not the whole PR
+- [x] 7.3 Implement still-open carry-forward: previously reported unresolved findings listed as "still open" in the upserted summary (resolved ones removed), with inline comments posted only for findings on newly changed code
+- [x] 7.4 Implement custom rules in `.aireview.toml`: user-written rules injected into the prompt, with per-path rule scoping
+- [x] 7.5 Implement the run log (PR, model, tokens, cost, findings kept/dropped, drop reasons) written locally per run for self-analytics
+- [x] 7.6 Optional RAG experiment: sqlite-vec index over house rules/ADRs/past findings, injected as clearly-labeled supplementary context behind a config flag, defaulting off
 - [ ] 7.7 Verify: pushing a 1-line fix to a 50-file dummy PR re-reviews only the new commit range and comments only on new/changed hunks; still-unfixed prior findings appear as "still open" in the summary, not re-posted inline
 - [ ] 7.8 Verify: a custom rule ("all API handlers must validate input with zod") fires on a violating dummy PR; write the RAG-on vs RAG-off comparison note in `docs/` from eval-set runs

@@ -19,3 +19,15 @@ compatibility_date = "2026-07-01"
 # Optional non-secret vars:
 # BOT_LOGIN = "my-review-app[bot]"   # the App's own login, used to skip self-generated events
 # REVIEW_MODEL = "haiku"             # haiku | gemini | groq
+
+# M5 per-PR state (task 7.1): last-reviewed SHA, hunk hashes, open findings.
+# OPTIONAL — without this binding the worker runs stateless (summary-marker
+# SHA only; no incremental scoping, no still-open carry-forward).
+# Setup (once, when deploys are allowed):
+#   wrangler kv namespace create REVIEW_STATE
+# then replace the placeholder id below with the one it prints.
+# `wrangler dev` uses a local simulated namespace, so the placeholder is fine
+# for local development. See docs/state-and-incremental.md.
+[[kv_namespaces]]
+binding = "REVIEW_STATE"
+id = "00000000000000000000000000000000" # placeholder — replace after `wrangler kv namespace create`

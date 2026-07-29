@@ -6,11 +6,20 @@
  * webhook context needs — installation-token auth, collaborator gating for
  * slash commands, and the 👀 acknowledgment.
  */
-import type { EngineConfig, FetchLike, PrIdentity, ReviewModel, ReviewResult, RunDeps } from "@code-review/engine";
+import type {
+  EngineConfig,
+  FetchLike,
+  KvLike,
+  PrIdentity,
+  ReviewModel,
+  ReviewResult,
+  RunDeps,
+} from "@code-review/engine";
 import {
   AnthropicProvider,
   GeminiFlashProvider,
   GroqProvider,
+  KvStateStore,
   fetchPrDiff,
   resolveProviderChoice,
   runReview,
@@ -31,6 +40,12 @@ export interface WorkerEnv {
   BOT_LOGIN?: string;
   /** Provider choice: haiku (default) | gemini | groq. */
   REVIEW_MODEL?: string;
+  /**
+   * Cloudflare KV binding for M5 per-PR state (task 7.1) — see wrangler.toml.
+   * Optional: absent → stateless mode. Typed as the engine's minimal KvLike
+   * slice so this package needs no Workers type dependency.
+   */
+  REVIEW_STATE?: KvLike;
 }
 
 /** Injectable collaborators so tests never touch the network or the real engine. */
@@ -68,6 +83,8 @@ function engineDeps(env: WorkerEnv, deps: HandlerDeps): { fetchImpl: FetchLike; 
       // No filesystem on Workers — inject the build-time-embedded template.
       promptTemplate: REVIEWER_PROMPT_TEMPLATE,
       env: env as unknown as Record<string, string | undefined>,
+      // M5 durable state on KV (7.1); absent binding → stateless mode.
+      stateStore: env.REVIEW_STATE ? new KvStateStore(env.REVIEW_STATE) : undefined,
     },
   };
 }

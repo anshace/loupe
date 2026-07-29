@@ -7,14 +7,17 @@
  *   - booleans: `true` / `false`
  *   - basic double-quoted strings: `"..."` (backslash escapes for `\"` and `\\`)
  *   - single-line arrays of basic strings: `["a", "b"]`
+ *   - `[[rules]]` array-of-tables (task 7.4) — the ONLY table form supported
  *   - full-line comments starting with `#`, and trailing `# ...` after a value
  *   - blank lines
- * Anything else (tables, multi-line values, numbers, dates, dotted keys...)
- * makes the file "invalid": the run proceeds on safe defaults and the summary
- * shows a visible notice (requirement: never crash, never skip).
+ * Anything else (other tables, multi-line values, numbers, dates, dotted
+ * keys...) makes the file "invalid": the run proceeds on safe defaults and
+ * the summary shows a visible notice (requirement: never crash, never skip).
  *
- * Recognized keys: enabled (bool), min_severity (string), ignore (string[]).
- * Unknown keys are ignored for forward compatibility.
+ * Recognized keys: enabled (bool), min_severity (string), ignore (string[]),
+ * rules (string[] — unscoped custom rules), plus `[[rules]]` tables with
+ * `text` (required) and `pattern` (path glob, default "**") for per-path rule
+ * scoping. Unknown keys are ignored for forward compatibility.
  */
 import type { FetchLike } from "./diff";
 import type { AuthToken, PrIdentity, Severity } from "./types";
@@ -22,10 +25,18 @@ import type { AuthToken, PrIdentity, Severity } from "./types";
 export const AIREVIEW_CONFIG_PATH = ".aireview.toml";
 export const HOUSE_RULES_PATH = "HOUSE_RULES.md";
 
+/** A user-written review rule, scoped to the paths matching `pattern` (7.4). */
+export interface CustomRule {
+  /** Path glob the rule applies to; "**" (everything) by default. */
+  pattern: string;
+  text: string;
+}
+
 export interface RepoConfig {
   enabled: boolean;
   minSeverity: Severity;
   ignore: string[];
+  rules: CustomRule[];
 }
 
 /** Documented safe defaults (task 4.8). */
@@ -33,7 +44,12 @@ export const DEFAULT_REPO_CONFIG: RepoConfig = {
   enabled: true,
   minSeverity: "medium",
   ignore: [],
+  rules: [],
 };
+
+function freshDefaults(): RepoConfig {
+  return { ...DEFAULT_REPO_CONFIG, ignore: [], rules: [] };
+}
 
 export interface ParsedRepoConfig {
   config: RepoConfig;
@@ -105,14 +121,23 @@ function parseValue(raw: string): TomlValue | undefined {
   return undefined;
 }
 
+const RULES_TABLE_HEADER = /^\[\[rules\]\]\s*(#.*)?$/;
+
 /** Parse .aireview.toml text. Never throws; invalid input → defaults + notice. */
 export function parseAireviewToml(text: string): ParsedRepoConfig {
   const problems: string[] = [];
   const values: Record<string, TomlValue> = {};
+  const ruleTables: Array<Record<string, TomlValue>> = [];
+  let currentRule: Record<string, TomlValue> | undefined;
 
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (line.length === 0 || line.startsWith("#")) continue;
+    if (RULES_TABLE_HEADER.test(line)) {
+      currentRule = {};
+      ruleTables.push(currentRule);
+      continue;
+    }
     const match = KEY_VALUE.exec(line);
     if (!match) {
       problems.push(`unparseable line: ${line.slice(0, 60)}`);
@@ -123,10 +148,11 @@ export function parseAireviewToml(text: string): ParsedRepoConfig {
       problems.push(`unsupported value for "${match[1]}"`);
       continue;
     }
-    values[match[1]] = value;
+    if (currentRule) currentRule[match[1]] = value;
+    else values[match[1]] = value;
   }
 
-  const config: RepoConfig = { ...DEFAULT_REPO_CONFIG, ignore: [...DEFAULT_REPO_CONFIG.ignore] };
+  const config: RepoConfig = freshDefaults();
 
   if ("enabled" in values) {
     if (typeof values.enabled === "boolean") config.enabled = values.enabled;
@@ -145,16 +171,38 @@ export function parseAireviewToml(text: string): ParsedRepoConfig {
     if (Array.isArray(v)) config.ignore = v;
     else problems.push(`"ignore" must be an array of glob strings`);
   }
+  // Custom rules (task 7.4): unscoped strings via `rules = [...]`...
+  if ("rules" in values) {
+    const v = values.rules;
+    if (Array.isArray(v)) {
+      config.rules.push(...v.map((text) => ({ pattern: "**", text })));
+    } else {
+      problems.push(`"rules" must be an array of rule strings`);
+    }
+  }
+  // ...and/or path-scoped `[[rules]]` tables with text (required) + pattern.
+  for (const table of ruleTables) {
+    if (typeof table.text !== "string" || table.text.length === 0) {
+      problems.push(`each [[rules]] table needs a non-empty "text" string`);
+      continue;
+    }
+    if ("pattern" in table && typeof table.pattern !== "string") {
+      problems.push(`[[rules]] "pattern" must be a glob string`);
+      continue;
+    }
+    config.rules.push({ pattern: typeof table.pattern === "string" ? table.pattern : "**", text: table.text });
+  }
 
   if (problems.length > 0) {
     // Malformed → run on FULL defaults (never a half-applied config) + notice.
-    return {
-      config: { ...DEFAULT_REPO_CONFIG, ignore: [...DEFAULT_REPO_CONFIG.ignore] },
-      invalid: true,
-      problems,
-    };
+    return { config: freshDefaults(), invalid: true, problems };
   }
   return { config, invalid: false, problems };
+}
+
+/** Rules applicable to this run: pattern matches at least one reviewed path. */
+export function applicableRules(rules: readonly CustomRule[], paths: readonly string[]): CustomRule[] {
+  return rules.filter((rule) => paths.some((path) => globMatch(rule.pattern, path)));
 }
 
 /**

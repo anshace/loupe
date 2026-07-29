@@ -117,12 +117,19 @@ export interface EngineConfig {
   escalation?: boolean;
   /** Cap on total enclosing-scope context characters; see DEFAULT_CONTEXT_CAP_CHARS. */
   contextCapChars?: number;
+  /** Path to the flat-JSONL run log (task 7.5). Absent → no run log written. */
+  runLogPath?: string;
+  /**
+   * Inject retrieved supplementary context via `deps.retriever` (task 7.6).
+   * Default OFF — this is the M5 RAG experiment, not core architecture.
+   */
+  rag?: boolean;
 }
 
 /** A file excluded before review, with the reason, for summary disclosure. */
 export interface SkippedFile {
   file: string;
-  reason: "lockfile" | "generated" | "vendored" | "binary" | "ignored";
+  reason: "lockfile" | "generated" | "vendored" | "binary" | "ignored" | "already-reviewed";
 }
 
 /** Why a finding was suppressed before publishing (explicit — never silent). */
@@ -150,6 +157,11 @@ export interface RunEvent {
   headSha?: string;
   /** Explicit on-demand request (e.g. /review) — overrides the same-SHA skip. */
   onDemand?: boolean;
+  /**
+   * Previous head SHA on a `synchronize` event — the compare base for
+   * incremental re-review scoping (task 7.2). Absent on opened/reopened.
+   */
+  before?: string;
 }
 
 /** A size-cap exclusion record — truncation is never silent. */
@@ -194,6 +206,13 @@ export interface ReviewResult {
   suppressed: SuppressedFinding[];
   /** Findings skipped because an identical bot comment already exists. */
   deduped: Finding[];
+  /**
+   * Previously reported findings still open after this run (carry-forward
+   * from state ∪ deduped re-emissions, task 7.3). Summary-only, never inline.
+   */
+  stillOpen: Finding[];
+  /** Present when the run reviewed an incremental before..after range (7.2). */
+  incremental?: { base: string; skippedHunks: number };
   /** Findings that could only be mentioned in the summary comment. */
   summaryFindings: Finding[];
   /** Config problems / degraded-mode / early-stop notices shown in the summary. */

@@ -48,6 +48,14 @@ describe("mapWebhook — pull_request", () => {
     expect(dispatch).toMatchObject({ kind: "review", event: { isDraft: true } });
   });
 
+  it("carries the top-level before SHA on synchronize (incremental scoping, 7.2)", () => {
+    const payload = { ...prPayload("synchronize"), before: "beforesha" };
+    expect(mapWebhook("pull_request", payload)).toMatchObject({
+      kind: "review",
+      event: { headSha: "abc123", before: "beforesha" },
+    });
+  });
+
   it("ignores a payload with no installation id", () => {
     const payload = prPayload("opened");
     delete payload.installation;

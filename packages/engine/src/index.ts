@@ -27,6 +27,10 @@ export * from "./scope";
 export * from "./agentic";
 export * from "./verify";
 export * from "./escalate";
+export * from "./state";
+export * from "./incremental";
+export * from "./runlog";
+export * from "./retrieve";
 export * from "./run";
 
 export * from "./stats";

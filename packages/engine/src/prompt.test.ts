@@ -3,14 +3,16 @@ import type { DiffFile } from "./diff";
 import { formatCommentableLines, loadPromptTemplate, renderPrompt } from "./prompt";
 
 describe("loadPromptTemplate", () => {
-  it("loads the default reviewer prompt (v3) from the repo prompts/ folder", () => {
+  it("loads the default reviewer prompt (v4) from the repo prompts/ folder", () => {
     const template = loadPromptTemplate();
     expect(template).toContain("Severity rubric");
     expect(template).toContain("Do NOT report");
     expect(template).toContain("{{DIFF}}");
     expect(template).toContain("{{COMMENTABLE_LINES}}");
     expect(template).toContain("{{HOUSE_RULES}}");
+    expect(template).toContain("{{CUSTOM_RULES}}");
     expect(template).toContain("{{CONTEXT}}");
+    expect(template).toContain("{{RETRIEVED_CONTEXT}}");
     expect(template).toContain("{{TOOLS}}");
   });
 
@@ -42,7 +44,9 @@ describe("renderPrompt", () => {
       DIFF: "diff --git a/x b/x",
       COMMENTABLE_LINES: "- x: 1-3",
       HOUSE_RULES: "(none)",
+      CUSTOM_RULES: "(none)",
       CONTEXT: "(none)",
+      RETRIEVED_CONTEXT: "(none)",
       TOOLS: "disabled",
     });
     expect(system).toContain("Severity rubric");

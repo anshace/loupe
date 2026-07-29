@@ -14,10 +14,12 @@ export interface PrEventInfo {
   isDraft: boolean;
   /** Login of the user that caused the event (sender), when present. */
   actor?: string;
+  /** Previous head SHA on a synchronize event — incremental scoping (7.2). */
+  before?: string;
 }
 
 export function extractPrEventInfo(payload: unknown): PrEventInfo {
-  const root = payload as { pull_request?: unknown; sender?: unknown } | null;
+  const root = payload as { pull_request?: unknown; sender?: unknown; before?: unknown } | null;
   const pr = root?.pull_request as Record<string, unknown> | undefined;
   if (!pr) throw new Error("event payload has no pull_request — is this a pull_request event?");
 
@@ -39,6 +41,7 @@ export function extractPrEventInfo(payload: unknown): PrEventInfo {
     deletions: num("deletions"),
     isDraft: pr.draft === true,
     actor: typeof senderLogin === "string" ? senderLogin : undefined,
+    before: typeof root?.before === "string" ? root.before : undefined,
   };
 }
 
@@ -53,5 +56,6 @@ export function toRunEvent(info: PrEventInfo): RunEvent {
     actor: info.actor,
     headSha: info.headSha,
     onDemand: false,
+    before: info.before,
   };
 }
