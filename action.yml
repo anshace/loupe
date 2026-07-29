@@ -1,0 +1,38 @@
+name: "Loupe"
+description: "Loupe — AI reviews your pull requests and posts inline comments + a summary, CodeRabbit-style, on your own LLM key."
+author: "anshace"
+
+branding:
+  icon: "git-pull-request"
+  color: "purple"
+
+inputs:
+  github-token:
+    description: "Token used to read the diff and post the review. The default workflow token is fine."
+    required: false
+    default: ${{ github.token }}
+  llm-api-key:
+    description: "API key for the LLM provider selected by review-model (Gemini / Anthropic / Groq). Store it as a repo secret."
+    required: true
+  review-model:
+    description: "Which model to review with: gemini | haiku | groq."
+    required: false
+    default: "haiku"
+  min-severity:
+    description: "Lowest finding severity to publish: critical | high | medium | low | nit."
+    required: false
+    default: "medium"
+  config-path:
+    description: "Path (at the PR head) to the repo review config file."
+    required: false
+    default: ".aireview.toml"
+  state-path:
+    description: "Optional path to a state file enabling incremental re-review + still-open carry-forward (persist it via actions/cache)."
+    required: false
+  run-log-path:
+    description: "Optional path to append a JSONL run-log record per review."
+    required: false
+
+runs:
+  using: "node20"
+  main: "dist/action/index.js"

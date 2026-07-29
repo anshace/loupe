@@ -84,6 +84,8 @@ export interface VerificationRecord {
 export interface EngineConfig {
   /** Findings below this severity are never published (overrides .aireview.toml). */
   minSeverity?: Severity;
+  /** Path to the repo config file, read at the PR head. Default ".aireview.toml". */
+  configPath?: string;
   /** Diff size caps; see DEFAULT_SIZE_CAPS. */
   sizeCap?: SizeCapConfig;
   /** Override path to the reviewer prompt markdown file. */

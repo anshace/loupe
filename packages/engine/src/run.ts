@@ -214,10 +214,11 @@ async function loadRepoConfig(
   headSha: string | undefined,
   fetchImpl: FetchLike,
   injected?: RepoFiles,
+  configPath: string = AIREVIEW_CONFIG_PATH,
 ): Promise<LoadedRepoConfig> {
   const files: RepoFiles =
     injected ?? {
-      config: await fetchRepoFile(pr, auth, AIREVIEW_CONFIG_PATH, headSha, fetchImpl),
+      config: await fetchRepoFile(pr, auth, configPath, headSha, fetchImpl),
       houseRules: await fetchRepoFile(pr, auth, HOUSE_RULES_PATH, headSha, fetchImpl),
     };
 
@@ -278,6 +279,7 @@ export async function runReview(
     config.event?.headSha,
     fetchImpl,
     deps.repoFiles,
+    config.configPath,
   );
   if (!repoConfig.enabled) {
     // Disabled → the run ends before any model call; no comments at all (4.7).

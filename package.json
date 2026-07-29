@@ -7,6 +7,7 @@
   ],
   "scripts": {
     "build": "tsc -b",
+    "build:action": "ncc build packages/action/src/main.ts -o dist/action",
     "typecheck": "tsc -b",
     "test": "vitest run",
     "eval": "node evals/run.mjs",
@@ -14,6 +15,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@vercel/ncc": "^0.44.1",
     "typescript": "^5.8.0",
     "vitest": "^3.2.0"
   }

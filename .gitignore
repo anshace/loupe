@@ -1,5 +1,14 @@
 node_modules/
 dist/
+# ...but the committed GitHub Action bundle (dist/action/index.js) IS tracked —
+# GitHub runs actions from committed code, not from an npm install. `dist/`
+# blocks descent, so re-include the root dist dir, re-ignore its other children,
+# then re-include only the bundle itself (not ncc's stray .d.ts output).
+!/dist/
+/dist/*
+!/dist/action/
+/dist/action/*
+!/dist/action/index.js
 .env
 .env.*
 __pycache__/
