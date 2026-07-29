@@ -1,5 +1,5 @@
 /**
- * Embeds prompts/reviewer-v2.md into src/generated/promptTemplate.ts.
+ * Embeds prompts/reviewer-v3.md into src/generated/promptTemplate.ts.
  *
  * The Workers runtime has no filesystem, so the engine's loadPromptTemplate
  * (node:fs) cannot run there; the worker instead injects the template via
@@ -12,12 +12,12 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const promptPath = resolve(here, "..", "..", "..", "prompts", "reviewer-v2.md");
+const promptPath = resolve(here, "..", "..", "..", "prompts", "reviewer-v3.md");
 const outPath = resolve(here, "..", "src", "generated", "promptTemplate.ts");
 
 const template = readFileSync(promptPath, "utf8");
 const banner =
-  "// AUTO-GENERATED from prompts/reviewer-v2.md by scripts/embed-prompt.mjs — DO NOT EDIT.\n" +
+  "// AUTO-GENERATED from prompts/reviewer-v3.md by scripts/embed-prompt.mjs — DO NOT EDIT.\n" +
   "// Regenerate with: node packages/worker/scripts/embed-prompt.mjs\n";
 
 mkdirSync(dirname(outPath), { recursive: true });

@@ -14,6 +14,8 @@ import type { TokenCapConfig } from "./types";
 export const PRICES_USD_PER_MTOK: Record<string, { input: number; output: number }> = {
   // Claude Haiku 4.5 — the M2 quality default.
   "claude-haiku-4-5": { input: 1, output: 5 },
+  // Claude Sonnet 5 — the M4 risk-escalation model (task 6.5).
+  "claude-sonnet-5": { input: 3, output: 15 },
   // Gemini 2.5 Flash free tier (dev/free mode).
   "gemini-2.5-flash": { input: 0, output: 0 },
   // Groq Llama free tier fallback.

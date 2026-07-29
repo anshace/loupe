@@ -56,7 +56,7 @@ function tryParse(text: string): unknown {
 }
 
 /** Parse candidates in order: as-is, fence-stripped, first bracketed slice. */
-function parseCandidates(raw: string): unknown {
+export function parseJsonCandidates(raw: string): unknown {
   const stripped = stripFences(raw);
   for (const candidate of [raw.trim(), stripped]) {
     const parsed = tryParse(candidate);
@@ -146,7 +146,7 @@ export function parseModelFindings(raw: string): GuardrailResult {
   if (typeof raw !== "string" || raw.trim().length === 0) {
     return { findings: [], degraded: true, droppedCount: 0 };
   }
-  const parsed = parseCandidates(raw);
+  const parsed = parseJsonCandidates(raw);
   const array = extractArray(parsed);
   if (array === undefined) {
     return { findings: [], degraded: true, droppedCount: 0 };
@@ -160,4 +160,68 @@ export function parseModelFindings(raw: string): GuardrailResult {
     else droppedCount += 1;
   }
   return { findings, degraded: false, droppedCount };
+}
+
+/**
+ * Agentic tool-call detection (task 6.3). Instead of a findings array, the
+ * model MAY return `{"tool_calls": [...]}`. Same defensive posture as
+ * findings parsing: tolerate wrapper-key and argument-key variants, drop
+ * malformed entries, never throw.
+ */
+export interface ToolCallRequest {
+  tool: "grep" | "read_file";
+  /** grep: the regex/substring to search for. */
+  pattern?: string;
+  /** grep: optional path prefix filter; read_file: the file to read. */
+  path?: string;
+}
+
+const TOOL_WRAPPER_KEYS = ["tool_calls", "toolCalls", "tools", "tool_requests"];
+
+function coerceToolCall(entry: unknown): ToolCallRequest | undefined {
+  if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+  const obj = entry as Record<string, unknown>;
+  const rawArgs = obj.args ?? obj.arguments ?? obj.input ?? obj.parameters;
+  const args =
+    rawArgs !== null && typeof rawArgs === "object" && !Array.isArray(rawArgs)
+      ? (rawArgs as Record<string, unknown>)
+      : obj; // args may be flattened onto the entry itself
+
+  const name = firstString(obj, ["tool", "name", "tool_name", "type"])
+    ?.toLowerCase()
+    .replace(/[-\s]/g, "_");
+  if (name === "grep" || name === "search") {
+    const pattern = firstString(args, ["pattern", "query", "regex", "q"]);
+    if (!pattern) return undefined;
+    return { tool: "grep", pattern, path: firstString(args, ["path", "dir", "prefix", "glob"]) };
+  }
+  if (name === "read_file" || name === "readfile" || name === "read" || name === "cat") {
+    const path = firstString(args, ["path", "file", "filename", "file_path", "filePath"]);
+    if (!path) return undefined;
+    return { tool: "read_file", path };
+  }
+  return undefined;
+}
+
+/**
+ * Returns the requested tool calls, or undefined when the output is not a
+ * tool-call response at all (then try `parseModelFindings`). An empty array
+ * means "the model wanted tools but every request was malformed" — the engine
+ * responds by forcing a findings answer.
+ */
+export function parseToolCalls(raw: string): ToolCallRequest[] | undefined {
+  if (typeof raw !== "string" || raw.trim().length === 0) return undefined;
+  const parsed = parseJsonCandidates(raw);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  for (const key of TOOL_WRAPPER_KEYS) {
+    const arr = (parsed as Record<string, unknown>)[key];
+    if (!Array.isArray(arr)) continue;
+    const out: ToolCallRequest[] = [];
+    for (const entry of arr) {
+      const call = coerceToolCall(entry);
+      if (call) out.push(call);
+    }
+    return out;
+  }
+  return undefined;
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseModelFindings } from "./guardrail";
+import { parseModelFindings, parseToolCalls } from "./guardrail";
 
 const VALID = {
   severity: "high",
@@ -155,5 +155,38 @@ describe("parseModelFindings", () => {
     for (const input of ["", "{", "]", "```\n```", "null", "true", '{"findings": "nope"}']) {
       expect(() => parseModelFindings(input)).not.toThrow();
     }
+  });
+});
+
+describe("parseToolCalls (task 6.3)", () => {
+  it("parses grep and read_file requests", () => {
+    const out = parseToolCalls(
+      '{"tool_calls": [{"tool": "grep", "pattern": "applyDiscount", "path": "src"}, {"tool": "read_file", "path": "src/a.ts"}]}',
+    );
+    expect(out).toEqual([
+      { tool: "grep", pattern: "applyDiscount", path: "src" },
+      { tool: "read_file", path: "src/a.ts" },
+    ]);
+  });
+
+  it("tolerates fences, name/arguments variants, and synonyms", () => {
+    const out = parseToolCalls(
+      '```json\n{"toolCalls": [{"name": "read-file", "arguments": {"file": "x.ts"}}, {"name": "search", "input": {"query": "foo"}}]}\n```',
+    );
+    expect(out).toEqual([
+      { tool: "read_file", path: "x.ts" },
+      { tool: "grep", pattern: "foo", path: undefined },
+    ]);
+  });
+
+  it("returns undefined for findings arrays and prose (not tool calls)", () => {
+    expect(parseToolCalls("[]")).toBeUndefined();
+    expect(parseToolCalls('[{"severity": "high"}]')).toBeUndefined();
+    expect(parseToolCalls("no issues found")).toBeUndefined();
+    expect(parseToolCalls("")).toBeUndefined();
+  });
+
+  it("returns an empty array when tool_calls exist but are all malformed", () => {
+    expect(parseToolCalls('{"tool_calls": [{"tool": "grep"}, {"tool": "launch_missiles", "path": "x"}]}')).toEqual([]);
   });
 });

@@ -37,6 +37,49 @@ export interface TokenCapConfig {
   maxOutputTokens?: number;
 }
 
+/** Hard caps on the agentic tool loop (task 6.3). All optional; defaults apply. */
+export interface AgenticCaps {
+  /** Max tool-execution rounds per run. */
+  maxHops?: number;
+  /** Max file contents fetched per run (read_file + grep reads combined). */
+  maxFileReads?: number;
+  /** Max total bytes of file content fetched per run. */
+  maxTotalBytes?: number;
+}
+
+/** Live counters for the agentic tool loop, shared across reviewer + verifier. */
+export interface AgenticUsage {
+  hops: number;
+  fileReads: number;
+  bytesRead: number;
+  /** True once any cap was hit — further tool calls are refused. */
+  cappedOut: boolean;
+}
+
+/** Closed drop-reason enum for the verifier pass (design decision 9). */
+export type DropReason =
+  | "false-claim"
+  | "pre-existing"
+  | "repo-convention"
+  | "out-of-scope"
+  | "theoretically-impossible";
+
+/** A finding the verifier dropped — always with a reason and cited evidence. */
+export interface DroppedFinding {
+  finding: Finding;
+  reason: DropReason;
+  evidence: string;
+}
+
+/** Outcome of the verifier pass, recorded on the run result. */
+export interface VerificationRecord {
+  /** True when the verifier output was unparseable → failed OPEN (originals published). */
+  degraded: boolean;
+  keptCount: number;
+  rewrittenCount: number;
+  dropped: DroppedFinding[];
+}
+
 /** Engine configuration. Grows with milestones (.aireview.toml keys land at M2). */
 export interface EngineConfig {
   /** Findings below this severity are never published (overrides .aireview.toml). */
@@ -55,6 +98,25 @@ export interface EngineConfig {
   tokenCaps?: TokenCapConfig;
   /** Path to the flat-JSON monthly spend ledger. Absent → per-run caps only. */
   ledgerPath?: string;
+  /**
+   * Give the reviewer/verifier capped grep + read-file tool access (task 6.3).
+   * Default OFF.
+   */
+  agentic?: boolean;
+  /** Overrides for the agentic hard caps; see DEFAULT_AGENTIC_CAPS. */
+  agenticCaps?: AgenticCaps;
+  /**
+   * Run the verifier pass (task 6.4). Default OFF — stays off until the eval
+   * set proves it kills ≥30% of raw findings correctly (task 6.8).
+   */
+  verify?: boolean;
+  /**
+   * Risk-based model escalation (task 6.5): risky changed paths route the
+   * review to Sonnet. Default ON; ignored when a model is injected via deps.
+   */
+  escalation?: boolean;
+  /** Cap on total enclosing-scope context characters; see DEFAULT_CONTEXT_CAP_CHARS. */
+  contextCapChars?: number;
 }
 
 /** A file excluded before review, with the reason, for summary disclosure. */
@@ -140,6 +202,10 @@ export interface ReviewResult {
   earlyStop: boolean;
   /** The upserted summary comment body (with hidden marker + state). */
   summaryComment?: string;
+  /** Verifier outcome, present only when the verifier pass produced a result. */
+  verification?: VerificationRecord;
+  /** Agentic tool-loop counters, present only when agentic mode was on. */
+  agenticUsage?: AgenticUsage;
 }
 
 const SEVERITY_RANK: Record<Severity, number> = {

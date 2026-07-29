@@ -9,6 +9,7 @@
     "build": "tsc -b",
     "typecheck": "tsc -b",
     "test": "vitest run",
+    "eval": "node evals/run.mjs",
     "dev:worker": "node packages/worker/scripts/embed-prompt.mjs && wrangler dev --config packages/worker/wrangler.toml"
   },
   "devDependencies": {

@@ -10,8 +10,8 @@ import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import type { DiffFile } from "./diff";
 
-/** The engine's default prompt version — M2 ships reviewer-v2 (do-not-report list + house rules). */
-export const REVIEWER_PROMPT_FILE = "reviewer-v2.md";
+/** The engine's default prompt version — M4 ships reviewer-v3 (context block + tool protocol). */
+export const REVIEWER_PROMPT_FILE = "reviewer-v3.md";
 
 const USER_MARKER = /^<!--\s*USER\s*-->\s*$/m;
 

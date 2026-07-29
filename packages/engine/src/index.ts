@@ -23,6 +23,10 @@ export * from "./suppress";
 export * from "./dedupe";
 export * from "./summary";
 export * from "./cost";
+export * from "./scope";
+export * from "./agentic";
+export * from "./verify";
+export * from "./escalate";
 export * from "./run";
 
 export * from "./stats";

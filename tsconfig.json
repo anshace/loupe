@@ -3,6 +3,7 @@
   "references": [
     { "path": "packages/engine" },
     { "path": "packages/action" },
-    { "path": "packages/worker" }
+    { "path": "packages/worker" },
+    { "path": "packages/scope-ts" }
   ]
 }

@@ -20,4 +20,8 @@ Versions:
 
 - `reviewer-v1.md` — M1 single-pass reviewer (rubric + line-range constraint).
 - `reviewer-v2.md` — M2: adds the do-not-report list and the `{{HOUSE_RULES}}`
-  block. **Current engine default.**
+  block.
+- `reviewer-v3.md` — M4: adds the `{{CONTEXT}}` enclosing-scope block and the
+  `{{TOOLS}}` capped agentic-tool protocol. **Current engine default.**
+- `verifier-v1.md` — M4: adversarial verifier — keep/rewrite/drop per finding
+  with cited `file:line` evidence and the closed drop-reason enum.

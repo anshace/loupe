@@ -1,15 +1,23 @@
 /**
- * The full M2 review pipeline:
+ * The full M4 review pipeline:
  *   gate (draft/bot-actor/same-SHA) → repo config (.aireview.toml at head) →
  *   diff fetch/parse → ignore-globs + noise filter + size cap →
- *   prompt (reviewer-v2 + HOUSE_RULES) → model (selected provider, cost caps) →
- *   JSON guardrail → suppression filter → anchoring chain → stateless dedupe →
+ *   enclosing-scope context (6.1) → provider selection + risk escalation (6.5) →
+ *   reviewer (reviewer-v3, optional capped agentic tool loop, 6.3) →
+ *   JSON guardrail → verifier pass (6.4, fail-open, optional) →
+ *   suppression filter → anchoring chain → stateless dedupe →
  *   ONE batched review + ONE upserted summary comment (marker + state SHA).
+ * Reviewer, verifier, and agentic hops share ONE per-run cost cap (6.6):
+ * when it would be exceeded, verifier/agentic work is skipped with a summary
+ * disclosure — never a hard failure.
  *
  * Invariant (task 4.2): no finding is ever silently dropped — every guardrail
  * finding ends up in payload comments, the review body (file-level), the
- * summary comment, the suppression record, or the dedupe record.
+ * summary comment, the suppression record, the dedupe record, or the
+ * verifier-drop record (which always carries reason + evidence).
  */
+import type { AgenticOptions, RepoReader } from "./agentic";
+import { agenticComplete, githubRepoReader, newAgenticUsage } from "./agentic";
 import type { AnchoredFinding, CommentableMap } from "./clamp";
 import { anchorFindings } from "./clamp";
 import type { RepoConfig } from "./config";
@@ -27,12 +35,17 @@ import type { ExistingComments } from "./dedupe";
 import { dedupeFindings, fetchExistingComments } from "./dedupe";
 import type { FetchLike } from "./diff";
 import { fetchPrDiff, parseUnifiedDiff } from "./diff";
+import { ESCALATION_MODEL, shouldEscalate } from "./escalate";
 import { shouldRun } from "./gate";
-import { parseModelFindings } from "./guardrail";
+import { parseModelFindings, parseToolCalls } from "./guardrail";
 import type { ReviewModel } from "./model";
-import { FREE_TIER_PROVIDER, resolveProviderChoice, selectProvider } from "./model";
+import { AnthropicProvider, FREE_TIER_PROVIDER, resolveProviderChoice, selectProvider } from "./model";
 import { filterNoise } from "./noise";
 import { formatCommentableLines, loadPromptTemplate, renderPrompt } from "./prompt";
+import type { ScopeExpander } from "./scope";
+import { RegexScopeExpander, buildContext } from "./scope";
+import type { ScopeInput } from "./scope";
+import { VERIFIER_PROMPT_FILE, applyVerdicts, formatFindingsForVerifier, parseVerifierOutput } from "./verify";
 import { buildReviewPayload, formatFileLevelSections, postReview } from "./publish";
 import { composeSummaryComment, findSummaryComment, upsertSummaryComment } from "./summary";
 import { applySuppressions } from "./suppress";
@@ -75,6 +88,18 @@ export interface RunDeps {
   repoFiles?: RepoFiles;
   /** Bypass fetching the PR's existing bot comments (tests). */
   existingComments?: ExistingComments;
+  /**
+   * Full file contents at the PR head, keyed by path (tests / alternate
+   * transports). When provided, it is authoritative: a missing key means
+   * "file unavailable" and NO contents-API fetch is attempted.
+   */
+  headFiles?: Record<string, string | undefined>;
+  /** Replace the enclosing-scope expander (e.g. tree-sitter from packages/scope-ts). */
+  scopeExpander?: ScopeExpander;
+  /** Bypass loading prompts/verifier-v1.md (tests / Workers path). */
+  verifierTemplate?: string;
+  /** Replace the agentic repo reader (tests). */
+  repoReader?: RepoReader;
   /** Environment for provider selection + monthly budget (default process.env). */
   env?: Record<string, string | undefined>;
   /** Ledger file IO overrides (tests). */
@@ -233,17 +258,25 @@ export async function runReview(
   skipped.push(...noiseSkipped);
   const { kept, exclusions } = applySizeCap(afterNoise, config.sizeCap);
 
-  // ── Provider selection (4.10) + monthly budget degrade (4.11).
+  // ── Provider selection (4.10) + monthly budget degrade (4.11) + escalation (6.5).
   let model = deps.model;
   if (!model) {
     let choice = resolveProviderChoice(env);
+    let budgetDegraded = false;
     if (isOverMonthlyBudget(env, config.ledgerPath, now(), deps.ledgerIo)) {
       if (choice !== FREE_TIER_PROVIDER) {
         notices.push("monthly budget exceeded — degraded to the free-tier model for this run");
       }
       choice = FREE_TIER_PROVIDER;
+      budgetDegraded = true;
     }
-    model = selectProvider(choice, fetchImpl);
+    if (!budgetDegraded && (config.escalation ?? true) && shouldEscalate(kept.map((f) => f.path))) {
+      // Risky paths (auth/payment/billing/migration/crypto/secret) → Sonnet.
+      model = new AnthropicProvider({ model: ESCALATION_MODEL, fetchImpl });
+      notices.push(`risky paths in this diff — review escalated to ${ESCALATION_MODEL}`);
+    } else {
+      model = selectProvider(choice, fetchImpl);
+    }
   }
   const tracker = new CostTracker(config.tokenCaps);
 
@@ -251,27 +284,123 @@ export async function runReview(
   let degraded = false;
   let earlyStop = false;
   let usage: ReviewResult["usage"];
+  let verification: ReviewResult["verification"];
+  let agenticUsage: ReviewResult["agenticUsage"];
   const nothingReviewable = kept.length === 0;
 
   if (!nothingReviewable) {
+    // ── Enclosing-scope context (6.1): full-file contents at the PR head,
+    // expanded to the surrounding function/class, capped, clearly labeled.
+    const expander = deps.scopeExpander ?? new RegexScopeExpander();
+    const scopeInputs: ScopeInput[] = [];
+    for (const file of kept) {
+      if (file.isBinary || file.status === "deleted" || file.hunks.length === 0) continue;
+      const content = deps.headFiles
+        ? deps.headFiles[file.path]
+        : await fetchRepoFile(pr, auth, file.path, config.event?.headSha, fetchImpl);
+      if (content !== undefined) {
+        scopeInputs.push({
+          path: file.path,
+          content,
+          // Expand around the ADDED lines of each hunk — surrounding context
+          // lines would drag the span past the actual enclosing scope.
+          hunks: file.hunks.map((h) => {
+            const added = h.lines
+              .filter((l) => l.type === "add" && l.newLine !== undefined)
+              .map((l) => l.newLine as number);
+            const start = added.length > 0 ? Math.min(...added) : h.newStart;
+            const end = added.length > 0 ? Math.max(...added) : h.newStart + Math.max(h.newLines - 1, 0);
+            return { newStart: start, newLines: end - start + 1 };
+          }),
+        });
+      }
+    }
+    const context = buildContext(scopeInputs, expander, { maxTotalChars: config.contextCapChars });
+    if (context.truncated) notices.push("enclosing-scope context truncated at the char cap");
+
+    // ── Agentic tool loop setup (6.3): OFF by default; one shared budget per run.
+    const agenticOn = config.agentic ?? false;
+    const agenticOpts: AgenticOptions | undefined = agenticOn
+      ? {
+          reader: deps.repoReader ?? githubRepoReader(pr, auth, config.event?.headSha, fetchImpl),
+          caps: config.agenticCaps,
+          usage: newAgenticUsage(),
+        }
+      : undefined;
+    const toolsText = agenticOn
+      ? "enabled — you may request tools as described in the system prompt."
+      : "disabled — respond with the required JSON array only.";
+    const diffText2 = kept.map((f) => f.rawText).join("\n");
+    const contextText = context.text || "(none)";
+
     if (!tracker.canProceed()) {
       earlyStop = true;
     } else {
       const template = deps.promptTemplate ?? loadPromptTemplate(config.promptPath);
       const rendered = renderPrompt(template, {
-        DIFF: kept.map((f) => f.rawText).join("\n"),
+        DIFF: diffText2,
         COMMENTABLE_LINES: formatCommentableLines(kept),
         HOUSE_RULES: houseRules?.trim() ? houseRules.trim() : "(none)",
+        CONTEXT: contextText,
+        TOOLS: toolsText,
       });
 
-      const response = await model.complete(rendered);
-      usage = { model: model.name, inputTokens: response.inputTokens, outputTokens: response.outputTokens };
-      earlyStop = tracker.record(model.name, response.inputTokens, response.outputTokens);
+      const loop = await agenticComplete(model, rendered, tracker, agenticOpts);
+      if (loop.costStopped) {
+        earlyStop = true;
+        if (agenticOn) notices.push("agentic search stopped: cost cap");
+      }
+      if (loop.response) {
+        if (!agenticOn && parseToolCalls(loop.response.text) !== undefined) {
+          // Tools are off; a tool-call answer degrades to summary-only.
+          notices.push("model requested tools but agentic mode is off");
+        }
+        const guard = parseModelFindings(loop.response.text);
+        degraded = guard.degraded;
+        rawFindings = guard.findings;
+      }
 
-      const guard = parseModelFindings(response.text);
-      degraded = guard.degraded;
-      rawFindings = guard.findings;
+      // ── Verifier pass (6.4): keep/rewrite/drop with evidence; fail OPEN.
+      // Default OFF until the eval set (6.8) proves it.
+      if ((config.verify ?? false) && !degraded && rawFindings.length > 0) {
+        if (!tracker.canProceed()) {
+          notices.push("verification skipped: cost cap");
+          earlyStop = true;
+        } else {
+          const verifierTemplate =
+            deps.verifierTemplate ?? loadPromptTemplate(undefined, VERIFIER_PROMPT_FILE);
+          const verifierRendered = renderPrompt(verifierTemplate, {
+            FINDINGS: formatFindingsForVerifier(rawFindings),
+            DIFF: diffText2,
+            CONTEXT: contextText,
+            TOOLS: toolsText,
+          });
+          const verifierLoop = await agenticComplete(model, verifierRendered, tracker, agenticOpts);
+          if (verifierLoop.costStopped && !verifierLoop.response) {
+            notices.push("verification skipped: cost cap");
+            earlyStop = true;
+          } else if (verifierLoop.response) {
+            const outcome = applyVerdicts(rawFindings, parseVerifierOutput(verifierLoop.response.text));
+            if (outcome.degraded) {
+              notices.push(
+                "verification degraded: verifier output could not be parsed — publishing unverified findings",
+              );
+            }
+            rawFindings = outcome.kept;
+            verification = {
+              degraded: outcome.degraded,
+              keptCount: outcome.kept.length,
+              rewrittenCount: outcome.rewrittenCount,
+              dropped: outcome.dropped,
+            };
+          }
+        }
+      }
+
+      usage = { model: model.name, inputTokens: tracker.inputTokens, outputTokens: tracker.outputTokens };
+      earlyStop = earlyStop || !tracker.canProceed();
     }
+    if (agenticOpts) agenticUsage = agenticOpts.usage;
   }
 
   // ── Suppression (4.1, 4.7, 4.9): do-not-report + house rules + min severity.
@@ -338,6 +467,7 @@ export async function runReview(
     exclusions,
     notices,
     earlyStop,
+    verifierDropped: verification?.dropped ?? [],
   });
 
   let posted = false;
@@ -371,5 +501,7 @@ export async function runReview(
     notices,
     earlyStop,
     summaryComment,
+    verification,
+    agenticUsage,
   };
 }

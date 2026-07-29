@@ -7,7 +7,15 @@
  */
 import type { FetchLike } from "./diff";
 import type { ExistingIssueComment } from "./dedupe";
-import type { AuthToken, Exclusion, Finding, PrIdentity, SkippedFile, SuppressedFinding } from "./types";
+import type {
+  AuthToken,
+  DroppedFinding,
+  Exclusion,
+  Finding,
+  PrIdentity,
+  SkippedFile,
+  SuppressedFinding,
+} from "./types";
 
 export const SUMMARY_MARKER = "<!-- ai-review-bot:summary -->";
 const STATE_MARKER = /<!--\s*ai-review-bot:state\s+(\{[\s\S]*?\})\s*-->/;
@@ -62,6 +70,8 @@ export interface SummaryCommentParts {
   /** Config problems, degraded-mode, budget and early-stop notices. */
   notices: string[];
   earlyStop: boolean;
+  /** Findings the verifier dropped (task 6.4) — disclosed, never silent. */
+  verifierDropped?: DroppedFinding[];
 }
 
 const severityLine = (f: Finding): string =>
@@ -101,6 +111,15 @@ export function composeSummaryComment(parts: SummaryCommentParts): string {
     sections.push(
       "**Still open from previous runs** (already reported, not re-posted inline):\n" +
         parts.stillOpen.map(severityLine).join("\n"),
+    );
+  }
+
+  if (parts.verifierDropped && parts.verifierDropped.length > 0) {
+    sections.push(
+      `**Dropped by verification** (${parts.verifierDropped.length}):\n` +
+        parts.verifierDropped
+          .map((d) => `- \`${d.finding.file}\` — **[${d.reason}]** ${d.finding.title} (evidence: ${d.evidence})`)
+          .join("\n"),
     );
   }
 

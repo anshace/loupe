@@ -20,7 +20,7 @@ const NO_COMMENTS: ExistingComments = { reviewComments: [], issueComments: [] };
 interface Captured {
   posts: ReviewPayload[];
   upserts: Array<{ body: string; existingId?: number }>;
-  deps: Pick<RunDeps, "post" | "upsertSummary" | "repoFiles" | "existingComments">;
+  deps: Pick<RunDeps, "post" | "upsertSummary" | "repoFiles" | "existingComments" | "headFiles">;
 }
 
 /** Capture both mutations and default to no repo files / no existing comments. */
@@ -39,6 +39,7 @@ function capture(): Captured {
       },
       repoFiles: {},
       existingComments: NO_COMMENTS,
+      headFiles: {},
     },
   };
 }
