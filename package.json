@@ -8,7 +8,8 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc -b",
-    "test": "vitest run"
+    "test": "vitest run",
+    "dev:worker": "node packages/worker/scripts/embed-prompt.mjs && wrangler dev --config packages/worker/wrangler.toml"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

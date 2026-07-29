@@ -48,13 +48,13 @@
 ## 5. M3 — GitHub App + Worker
 
 - [ ] 5.1 Register the GitHub App (permissions: Pull requests r/w, Contents read, Issues r/w, Checks r/w, Metadata; events: pull_request, issue_comment); store App ID, private key, and webhook secret as local dev secrets — no deploy yet
-- [ ] 5.2 Scaffold `packages/worker` with Hono targeting the Cloudflare Workers runtime; local dev via `wrangler dev` + smee.io webhook proxy into the test repo
-- [ ] 5.3 Implement raw-body HMAC-SHA256 webhook signature verification with constant-time compare BEFORE any payload parsing; missing/invalid signature → 401 and no further processing (tests with forged and unsigned payloads)
-- [ ] 5.4 Implement event routing: `pull_request` (opened/synchronize/reopened/ready_for_review) and `issue_comment` (`/review`, `/ask`) dispatch into the same engine gate used by the Action path
-- [ ] 5.5 Implement JWT → installation token minting with ~1h in-memory caching per installation
-- [ ] 5.6 Implement `/review` and `/ask` command handling gated to repository collaborators via the collaborators API; non-collaborator commands ignored with no run, comment, or reaction; `/review` on an already-reviewed head SHA still runs (explicit request overrides the skip)
-- [ ] 5.7 Implement the 👀 reaction acknowledgment on the triggering comment for accepted commands, added before any review output is posted
-- [ ] 5.8 Keep the Action path green: run the Action adapter's tests in CI alongside the worker's to confirm both wrappers drive the same engine
+- [x] - [ ] 5.2 Scaffold `packages/worker` with Hono targeting the Cloudflare Workers runtime; local dev via `wrangler dev` + smee.io webhook proxy into the test repo
+- [x] - [ ] 5.3 Implement raw-body HMAC-SHA256 webhook signature verification with constant-time compare BEFORE any payload parsing; missing/invalid signature → 401 and no further processing (tests with forged and unsigned payloads)
+- [x] - [ ] 5.4 Implement event routing: `pull_request` (opened/synchronize/reopened/ready_for_review) and `issue_comment` (`/review`, `/ask`) dispatch into the same engine gate used by the Action path
+- [x] - [ ] 5.5 Implement JWT → installation token minting with ~1h in-memory caching per installation
+- [x] - [ ] 5.6 Implement `/review` and `/ask` command handling gated to repository collaborators via the collaborators API; non-collaborator commands ignored with no run, comment, or reaction; `/review` on an already-reviewed head SHA still runs (explicit request overrides the skip)
+- [x] - [ ] 5.7 Implement the 👀 reaction acknowledgment on the triggering comment for accepted commands, added before any review output is posted
+- [x] - [ ] 5.8 Keep the Action path green: run the Action adapter's tests in CI alongside the worker's to confirm both wrappers drive the same engine
 - [ ] 5.9 Verify: App installed on ≥2 local test repos reviews PRs on both with no workflow file; forged/unsigned webhooks get 401; collaborator `/review` triggers a run with a reaction ack; non-collaborator `/review` produces nothing
 
 ## 6. M4 — Context Depth + Verifier

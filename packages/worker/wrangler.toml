@@ -1,0 +1,21 @@
+# Cloudflare Worker config for the GitHub App webhook adapter (M3, task 5.2).
+#
+# Local dev:   nub run dev:worker   (wrangler dev on http://localhost:8787)
+# Webhooks in dev arrive via a smee.io proxy — see docs/github-app-setup.md.
+#
+# Secrets are NEVER stored in this file. Set each one with:
+#   wrangler secret put GITHUB_APP_ID
+#   wrangler secret put GITHUB_APP_PRIVATE_KEY   # full PKCS#8 PEM, including BEGIN/END lines
+#   wrangler secret put GITHUB_WEBHOOK_SECRET
+#   wrangler secret put ANTHROPIC_API_KEY
+#   wrangler secret put GEMINI_API_KEY
+# For `wrangler dev`, put the same names in packages/worker/.dev.vars (gitignored).
+
+name = "code-review-worker"
+main = "src/index.ts"
+compatibility_date = "2026-07-01"
+
+[vars]
+# Optional non-secret vars:
+# BOT_LOGIN = "my-review-app[bot]"   # the App's own login, used to skip self-generated events
+# REVIEW_MODEL = "haiku"             # haiku | gemini | groq

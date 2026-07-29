@@ -17,6 +17,7 @@
     "additions": 42,
     "deletions": 7
   },
+  "sender": { "login": "anshace" },
   "repository": {
     "name": "code-review-testbed",
     "full_name": "anshace/code-review-testbed",

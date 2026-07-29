@@ -1,0 +1,17 @@
+{
+  "name": "@code-review/worker",
+  "private": true,
+  "version": "0.0.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "embed-prompt": "node scripts/embed-prompt.mjs",
+    "dev": "node scripts/embed-prompt.mjs && wrangler dev"
+  },
+  "dependencies": {
+    "@code-review/engine": "*",
+    "hono": "^4.12.32"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
