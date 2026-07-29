@@ -146,7 +146,7 @@ describe("runReview — verifier pass (6.4)", () => {
       JSON.stringify([FINDING, SECOND_FINDING]),
       JSON.stringify([
         { id: 1, verdict: "keep", evidence: "src/pricing.ts:2" },
-        { id: 2, verdict: "drop", reason: "out-of-scope", evidence: "src/pricing.ts:5 — unused-export is not a defect" },
+        { id: 2, verdict: "drop", reason: "out-of-scope", evidence: "src/pricing.ts:5 — export const ZERO = 0;" },
       ]),
     ]);
     const deps = baseDeps(model);
@@ -275,5 +275,72 @@ describe("runReview — risk-based escalation (6.5)", () => {
   it("respects the escalation: false override", async () => {
     const result = await runReview(pr, "tok", { escalation: false }, escalationDeps("haiku"));
     expect(result.usage?.model).toBe("claude-haiku-4-5");
+  });
+});
+
+describe("runReview — PR intent + security checklist (features #3, #5)", () => {
+  it("injects the PR intent block from injected intent", async () => {
+    const model = new ReplayModel(["[]"]);
+    const deps = { ...baseDeps(model), prIntent: { title: "Fix discount math", body: "Closes #42.", linkedIssues: [42] } };
+    await runReview(pr, "tok", {}, deps);
+    const user = model.requests[0].user;
+    expect(user).toContain("Title: Fix discount math");
+    expect(user).toContain("Linked issues (closed by this PR): #42");
+  });
+
+  it("renders (none) for PR intent when the fetch yields nothing", async () => {
+    const model = new ReplayModel(["[]"]);
+    // baseDeps' diffFetch serves the diff for every URL; the intent JSON.parse fails → fail-soft.
+    await runReview(pr, "tok", {}, baseDeps(model));
+    expect(model.requests[0].user).toContain("<pr-intent>\n(none)\n</pr-intent>");
+  });
+
+  it("injects a per-language CWE checklist for the diff's languages", async () => {
+    const model = new ReplayModel(["[]"]);
+    await runReview(pr, "tok", {}, { ...baseDeps(model), prIntent: undefined });
+    const user = model.requests[0].user;
+    expect(user).toContain("**TypeScript/JavaScript**");
+    expect(user).toContain("CWE-89");
+  });
+});
+
+describe("runReview — verifier grounding + abstention (features #1, #6)", () => {
+  const SECOND = {
+    ...FINDING,
+    line: 5,
+    title: "ZERO constant is unused",
+    body: "The exported ZERO constant is never used.",
+  };
+
+  it("discloses an insufficient-context abstention distinctly from a drop", async () => {
+    const model = new ReplayModel([
+      JSON.stringify([FINDING, SECOND]),
+      JSON.stringify([
+        { id: 1, verdict: "keep", evidence: "src/pricing.ts:2 — Math.round(totalCents" },
+        { id: 2, verdict: "drop", reason: "insufficient-context" },
+      ]),
+    ]);
+    const deps = baseDeps(model);
+    const result = await runReview(pr, "tok", { verify: true }, deps);
+
+    expect(result.findings.map((f) => f.title)).toEqual([FINDING.title]);
+    expect(result.verification?.dropped).toHaveLength(1);
+    expect(result.verification?.dropped[0].reason).toBe("insufficient-context");
+    expect(deps.upserts[0]).toContain("Could not confirm — insufficient context");
+    expect(deps.upserts[0]).not.toContain("Dropped by verification");
+  });
+
+  it("keeps a finding whose keep evidence is fabricated, and discloses it as ungrounded", async () => {
+    const model = new ReplayModel([
+      JSON.stringify([FINDING]),
+      JSON.stringify([{ id: 1, verdict: "keep", evidence: "src/pricing.ts:2 — launchTheMissiles()" }]),
+    ]);
+    const deps = baseDeps(model);
+    const result = await runReview(pr, "tok", { verify: true }, deps);
+
+    expect(result.findings).toHaveLength(1); // kept — never silently dropped
+    expect(result.verification?.ungrounded).toHaveLength(1);
+    expect(result.verification?.ungrounded[0].reason).toBe("quote-not-found");
+    expect(deps.upserts[0]).toContain("could not ground its cited evidence for 1 verdict");
   });
 });

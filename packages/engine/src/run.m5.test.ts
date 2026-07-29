@@ -103,6 +103,9 @@ function harness(model: MockProvider, extra: Partial<RunDeps> = {}): Harness {
       repoFiles: {},
       existingComments: NO_COMMENTS,
       headFiles: {},
+      // These tests exercise incremental/state/run-log wiring, not PR-intent —
+      // bypass the GET /pulls/{n} intent fetch (the key's presence disables it).
+      prIntent: undefined,
       post: async (_p, _a, payload) => {
         posts.push(payload);
       },
@@ -327,6 +330,8 @@ describe("runReview — run log (7.5)", () => {
       findingsDropped: 1,
       dropReasons: { "style-nit": 1 },
       verifierDropped: 0,
+      abstained: 0,
+      verifierUngrounded: 0,
       escalated: false,
       incremental: false,
     });

@@ -23,3 +23,12 @@ export function isRiskyPath(path: string): boolean {
 export function shouldEscalate(paths: readonly string[]): boolean {
   return paths.some(isRiskyPath);
 }
+
+/**
+ * The subset of changed paths that look risky. The same signal `shouldEscalate`
+ * uses for model routing, exposed so the summary comment can disclose WHY a PR
+ * is flagged risky (feature #9 risk verdict) instead of discarding it.
+ */
+export function riskyPaths(paths: readonly string[]): string[] {
+  return paths.filter(isRiskyPath);
+}

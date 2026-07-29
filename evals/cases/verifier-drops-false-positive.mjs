@@ -33,12 +33,14 @@ export default {
       ),
     ]),
     JSON.stringify([
-      { id: 1, verdict: "keep", evidence: "src/discount.ts:5 — (1 - discountPercent) with a 0-100 input" },
+      { id: 1, verdict: "keep", evidence: "src/discount.ts:5 — Math.round(totalCents * (1 - discountPercent))" },
       {
         id: 2,
         verdict: "drop",
         reason: "false-claim",
-        evidence: "src/discount.ts:2-3 — the range check exists directly above",
+        // Verbatim quote of the guard that proves the "not validated" claim false
+        // (feature #1 requires a grounded quote, not prose, for a drop to stick).
+        evidence: "src/discount.ts:2 — if (discountPercent < 0 || discountPercent > 100) {",
       },
     ]),
   ],

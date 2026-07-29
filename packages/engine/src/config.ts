@@ -37,6 +37,15 @@ export interface RepoConfig {
   minSeverity: Severity;
   ignore: string[];
   rules: CustomRule[];
+  /**
+   * Path globs exempt from the deterministic secret pre-pass (feature #2) —
+   * e.g. test fixtures or example files that legitimately contain fake keys.
+   * Distinct from `ignore` (which drops files from review entirely): a file can
+   * still be reviewed while being exempt from secret scanning.
+   */
+  secretAllowPaths: string[];
+  /** Literal substrings marking a matched secret value as known-safe (feature #2). */
+  secretAllowPatterns: string[];
 }
 
 /** Documented safe defaults (task 4.8). */
@@ -45,10 +54,12 @@ export const DEFAULT_REPO_CONFIG: RepoConfig = {
   minSeverity: "medium",
   ignore: [],
   rules: [],
+  secretAllowPaths: [],
+  secretAllowPatterns: [],
 };
 
 function freshDefaults(): RepoConfig {
-  return { ...DEFAULT_REPO_CONFIG, ignore: [], rules: [] };
+  return { ...DEFAULT_REPO_CONFIG, ignore: [], rules: [], secretAllowPaths: [], secretAllowPatterns: [] };
 }
 
 export interface ParsedRepoConfig {
@@ -170,6 +181,17 @@ export function parseAireviewToml(text: string): ParsedRepoConfig {
     const v = values.ignore;
     if (Array.isArray(v)) config.ignore = v;
     else problems.push(`"ignore" must be an array of glob strings`);
+  }
+  // Secret pre-pass allowlist (feature #2) — both are arrays of strings.
+  if ("secret_allow_paths" in values) {
+    const v = values.secret_allow_paths;
+    if (Array.isArray(v)) config.secretAllowPaths = v;
+    else problems.push(`"secret_allow_paths" must be an array of glob strings`);
+  }
+  if ("secret_allow_patterns" in values) {
+    const v = values.secret_allow_patterns;
+    if (Array.isArray(v)) config.secretAllowPatterns = v;
+    else problems.push(`"secret_allow_patterns" must be an array of strings`);
   }
   // Custom rules (task 7.4): unscoped strings via `rules = [...]`...
   if ("rules" in values) {

@@ -13,6 +13,8 @@ const record = (over: Partial<RunLogRecord> = {}): RunLogRecord => ({
   findingsDropped: 3,
   dropReasons: { "style-nit": 2, duplicate: 1 },
   verifierDropped: 0,
+  abstained: 0,
+  verifierUngrounded: 0,
   escalated: false,
   incremental: true,
   ...over,

@@ -10,7 +10,18 @@ export interface Finding {
   line?: number;
   title: string;
   body: string;
+  /** Free-text prose fix. Rendered as "Suggested fix:" markdown. */
   suggestion?: string;
+  /**
+   * A committable single-line replacement (feature #7): the EXACT new text for
+   * the one line at `line`, emitted by the reviewer ONLY when the fix is a
+   * clean same-line swap. When the finding anchors to an EXACT commentable line
+   * (not a clamped/nearest one), publish.ts renders this as a GitHub
+   * ```suggestion block so the human gets a one-click "Commit suggestion"
+   * button; otherwise it falls back to the prose `suggestion`. Preserves the
+   * line's own leading indentation; always a single line.
+   */
+  suggestedLine?: string;
 }
 
 /** Which PR to review, independent of how the run was triggered. */
@@ -18,6 +29,21 @@ export interface PrIdentity {
   owner: string;
   repo: string;
   prNumber: number;
+}
+
+/**
+ * The PR's stated intent (feature #3): title, body, and the issue numbers its
+ * body closes (GitHub closing-keyword regex, e.g. "fixes #12"). Fetched with
+ * one REST call and injected as the {{PR_INTENT}} reviewer prompt block so the
+ * model can judge whether the diff does what the author says — and flag
+ * described-but-unimplemented / unrelated out-of-scope changes. Fail-soft:
+ * absent when the PR has no body or the fetch failed → the block is omitted.
+ */
+export interface PrIntent {
+  title?: string;
+  body?: string;
+  /** Issue numbers referenced by closing keywords in the PR body. */
+  linkedIssues: number[];
 }
 
 /** An installation or workflow token; the engine never mints or stores one. */
@@ -56,19 +82,41 @@ export interface AgenticUsage {
   cappedOut: boolean;
 }
 
-/** Closed drop-reason enum for the verifier pass (design decision 9). */
+/**
+ * Closed drop-reason enum for the verifier pass (design decision 9).
+ * `insufficient-context` is the abstention value (feature #6): the verifier
+ * noticed a claim it genuinely could not ground in the supplied diff/context —
+ * logged DISTINCTLY from "no issue found", never a confident false-positive drop.
+ */
 export type DropReason =
   | "false-claim"
   | "pre-existing"
   | "repo-convention"
   | "out-of-scope"
-  | "theoretically-impossible";
+  | "theoretically-impossible"
+  | "insufficient-context";
 
 /** A finding the verifier dropped — always with a reason and cited evidence. */
 export interface DroppedFinding {
   finding: Finding;
   reason: DropReason;
   evidence: string;
+}
+
+/** The three verifier verdict kinds (mirrors verify.ts `VerifierVerdict`). */
+export type VerifierVerdictKind = "keep" | "rewrite" | "drop";
+
+/**
+ * A verifier verdict whose cited evidence failed the deterministic grounding
+ * check (feature #1): the finding is NOT silently dropped — it is kept (fail
+ * open) and flagged here so the summary/run log can disclose that the
+ * verifier's rubber stamp was not trustworthy for this finding.
+ */
+export interface UngroundedVerdict {
+  finding: Finding;
+  verdict: VerifierVerdictKind;
+  /** Why grounding failed: the verdict carried no evidence, or the quote was not in the payload. */
+  reason: "missing-evidence" | "quote-not-found";
 }
 
 /** Outcome of the verifier pass, recorded on the run result. */
@@ -78,6 +126,8 @@ export interface VerificationRecord {
   keptCount: number;
   rewrittenCount: number;
   dropped: DroppedFinding[];
+  /** Verdicts whose evidence could not be grounded (feature #1) — kept, but flagged. */
+  ungrounded: UngroundedVerdict[];
 }
 
 /** Engine configuration. Grows with milestones (.aireview.toml keys land at M2). */
@@ -145,6 +195,22 @@ export interface EngineConfig {
    * Default OFF — this is the M5 RAG experiment, not core architecture.
    */
   rag?: boolean;
+  /**
+   * Fetch the PR's title/body + linked issues and inject them as the
+   * {{PR_INTENT}} reviewer block (feature #3). Default ON; fail-soft — a PR
+   * with no body simply omits the block.
+   */
+  prIntent?: boolean;
+  /**
+   * Cross-file recall (report item #8): deterministically detect exported
+   * signature changes and FORCE-inject their call sites from other files into
+   * the reviewer prompt ({{CROSS_FILE_CALLERS}}). Default OFF — it runs a
+   * whole-repo import scan (many read calls), so it stays opt-in until the eval
+   * set proves its recall win, mirroring the verifier/agentic defaults.
+   */
+  crossFileCallers?: boolean;
+  /** Overrides for the cross-file import-scan budget; see DEFAULT_IMPORT_SCAN_CAPS. */
+  crossFileCaps?: AgenticCaps;
 }
 
 /** A file excluded before review, with the reason, for summary disclosure. */
@@ -259,4 +325,19 @@ const SEVERITY_RANK: Record<Severity, number> = {
 /** True when `a` is at least as severe as `b`. */
 export function atLeastSeverity(a: Severity, b: Severity): boolean {
   return SEVERITY_RANK[a] >= SEVERITY_RANK[b];
+}
+
+/** Numeric rank of a severity (critical highest). Exposed for ordering. */
+export function severityRank(s: Severity): number {
+  return SEVERITY_RANK[s];
+}
+
+/**
+ * Comparator: most-severe first (critical → nit). Stable when fed to
+ * Array.prototype.sort (ES2019+), so equal-severity findings keep their
+ * original relative order — used for severity-first comment/table ordering
+ * (feature #9d).
+ */
+export function bySeverityDesc(a: { severity: Severity }, b: { severity: Severity }): number {
+  return SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity];
 }

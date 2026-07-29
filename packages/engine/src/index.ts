@@ -11,6 +11,8 @@
 export * from "./types";
 export * from "./diff";
 export * from "./noise";
+export * from "./secrets";
+export * from "./workflowcheck";
 export * from "./sizeCap";
 export * from "./model";
 export * from "./prompt";
@@ -25,12 +27,14 @@ export * from "./summary";
 export * from "./cost";
 export * from "./scope";
 export * from "./agentic";
+export * from "./importgraph";
 export * from "./verify";
 export * from "./escalate";
 export * from "./state";
 export * from "./incremental";
 export * from "./runlog";
 export * from "./retrieve";
+export * from "./intent";
 export * from "./run";
 
 export * from "./stats";

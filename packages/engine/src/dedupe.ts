@@ -73,6 +73,76 @@ export function isDuplicate(
   return false;
 }
 
+/**
+ * Conservative near-duplicate key (feature #10): category + normalized title.
+ * Two findings share a key only when they are, by title and category, the SAME
+ * issue — so distinct issues (different title OR different category) never
+ * cluster together.
+ */
+export function nearDuplicateKey(finding: Finding): string {
+  return `${finding.category.toLowerCase().trim()}::${normalizeSubstance(finding.title)}`;
+}
+
+function locationLabel(finding: Finding): string {
+  return finding.line !== undefined ? `\`${finding.file}\`:${finding.line}` : `\`${finding.file}\``;
+}
+
+export interface GroupResult<T> {
+  /** One representative per cluster, in the original first-seen order. */
+  kept: T[];
+  /** Non-representative members folded into a representative — disclosed, not lost. */
+  folded: Finding[];
+}
+
+/**
+ * Intra-run near-duplicate grouping (feature #10): cluster findings that are the
+ * SAME issue repeated across files/lines into ONE representative comment, with an
+ * "Also found in:" list of the other locations appended to its body — instead of
+ * posting N near-identical comments. Pure post-processing, runs just before
+ * publishing. Matching is deliberately conservative (identical category +
+ * normalized title), so genuinely different findings are never merged. A cluster
+ * of size one is returned unchanged. Folded members are returned in `folded`
+ * (never silently dropped — they are disclosed in the representative's body).
+ */
+export function groupNearDuplicates<T extends { finding: Finding }>(candidates: readonly T[]): GroupResult<T> {
+  const clusters = new Map<string, T[]>();
+  const order: string[] = [];
+  for (const candidate of candidates) {
+    const key = nearDuplicateKey(candidate.finding);
+    const bucket = clusters.get(key);
+    if (bucket) {
+      bucket.push(candidate);
+    } else {
+      clusters.set(key, [candidate]);
+      order.push(key);
+    }
+  }
+
+  const kept: T[] = [];
+  const folded: Finding[] = [];
+  for (const key of order) {
+    const members = clusters.get(key) as T[];
+    if (members.length === 1) {
+      kept.push(members[0]);
+      continue;
+    }
+    const [representative, ...rest] = members;
+    const repLabel = locationLabel(representative.finding);
+    const alsoIn: string[] = [];
+    for (const member of rest) {
+      folded.push(member.finding);
+      const label = locationLabel(member.finding);
+      if (label !== repLabel && !alsoIn.includes(label)) alsoIn.push(label);
+    }
+    const body =
+      alsoIn.length > 0
+        ? `${representative.finding.body}\n\n_Also found in:_ ${alsoIn.join(", ")}`
+        : representative.finding.body;
+    kept.push({ ...representative, finding: { ...representative.finding, body } });
+  }
+  return { kept, folded };
+}
+
 export interface DedupeResult<T> {
   kept: T[];
   deduped: Finding[];

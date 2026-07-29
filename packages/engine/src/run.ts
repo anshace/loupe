@@ -38,10 +38,10 @@ import {
 import type { LedgerIo } from "./cost";
 import { CostTracker, isOverMonthlyBudget, monthKey, recordSpend } from "./cost";
 import type { ExistingComments } from "./dedupe";
-import { dedupeFindings, fetchExistingComments } from "./dedupe";
+import { dedupeFindings, fetchExistingComments, groupNearDuplicates } from "./dedupe";
 import type { FetchLike } from "./diff";
 import { fetchPrDiff, parseUnifiedDiff } from "./diff";
-import { ESCALATION_MODEL, shouldEscalate } from "./escalate";
+import { ESCALATION_MODEL, riskyPaths, shouldEscalate } from "./escalate";
 import { shouldRun } from "./gate";
 import { decideScope, dropReviewedHunks, fetchCompareDiff } from "./incremental";
 import type { Retriever } from "./retrieve";
@@ -67,11 +67,21 @@ import {
   selectProvider,
 } from "./model";
 import { filterNoise } from "./noise";
-import { formatCommentableLines, loadPromptTemplate, renderPrompt } from "./prompt";
+import { DEFAULT_IMPORT_SCAN_CAPS, collectSignatureChangeCallers } from "./importgraph";
+import { scanSecrets } from "./secrets";
+import { checkWorkflows } from "./workflowcheck";
+import { fetchPrIntent, renderPrIntent } from "./intent";
+import { buildSecurityChecklist, formatCommentableLines, loadPromptTemplate, renderPrompt } from "./prompt";
 import type { ScopeExpander } from "./scope";
 import { RegexScopeExpander, buildContext } from "./scope";
 import type { ScopeInput } from "./scope";
-import { VERIFIER_PROMPT_FILE, applyVerdicts, formatFindingsForVerifier, parseVerifierOutput } from "./verify";
+import {
+  VERIFIER_PROMPT_FILE,
+  applyVerdicts,
+  buildGroundingSource,
+  formatFindingsForVerifier,
+  parseVerifierOutput,
+} from "./verify";
 import { buildReviewPayload, formatFileLevelSections, postReview } from "./publish";
 import { composeSummaryComment, findSummaryComment, upsertSummaryComment } from "./summary";
 import { applySuppressions } from "./suppress";
@@ -82,11 +92,13 @@ import type {
   Exclusion,
   Finding,
   PrIdentity,
+  PrIntent,
   ReviewPayload,
   ReviewResult,
   SkippedFile,
   SuppressedFinding,
 } from "./types";
+import { bySeverityDesc } from "./types";
 
 /**
  * Repo-committed files the pipeline reads from the PR head. Tests (and
@@ -142,6 +154,12 @@ export interface RunDeps {
   runLogIo?: RunLogIo;
   /** Retrieval implementation for the RAG experiment (task 7.6, packages/rag). */
   retriever?: Retriever;
+  /**
+   * Pre-fetched PR intent (feature #3). When provided (even as an explicit
+   * undefined via a set key), NO GET /pulls/{n} call is made — tests inject it;
+   * production fetches it when `config.prIntent` is on.
+   */
+  prIntent?: PrIntent;
 }
 
 export interface SummaryParts {
@@ -452,6 +470,56 @@ export async function runReview(
     const context = buildContext(scopeInputs, expander, { maxTotalChars: config.contextCapChars });
     if (context.truncated) notices.push("enclosing-scope context truncated at the char cap");
 
+    // ── Cross-file caller injection (report item #8): deterministically detect
+    // exported signature changes in the diff and FORCE-inject their call sites
+    // from other files, so a caller left unupdated is surfaced even if the model
+    // wouldn't grep for it. Opt-in (a whole-repo import scan) and fail-soft.
+    let crossFileText = "(none)";
+    if (config.crossFileCallers ?? false) {
+      const reader = deps.repoReader ?? githubRepoReader(pr, auth, config.event?.headSha, fetchImpl);
+      try {
+        const injected = await collectSignatureChangeCallers(
+          kept,
+          reader,
+          { ...DEFAULT_IMPORT_SCAN_CAPS, ...config.crossFileCaps },
+          newAgenticUsage(),
+        );
+        if (injected.text) crossFileText = injected.text;
+        if (injected.truncated) {
+          notices.push("cross-file caller injection truncated at the cap — some call sites may be omitted");
+        }
+      } catch {
+        notices.push("cross-file caller scan failed — continuing without it");
+      }
+    }
+
+    // ── Grounding source (feature #1): the exact diff-line contents + context
+    // text sent to the model, for the verifier's deterministic quote check.
+    // The injected call sites are part of what the reviewer saw, so include them
+    // so the verifier can ground a caller-mismatch quote.
+    const groundingSource = buildGroundingSource(
+      kept.map((f) => ({
+        path: f.path,
+        lines: f.hunks.flatMap((h) =>
+          h.lines
+            .filter((l) => l.newLine !== undefined)
+            .map((l) => ({ line: l.newLine as number, content: l.content })),
+        ),
+      })),
+      crossFileText === "(none)" ? context.text : `${context.text}\n\n${crossFileText}`,
+    );
+
+    // ── PR intent (feature #3): title/body + linked issues, one REST call,
+    // fail-soft (default ON). deps.prIntent (tests) bypasses the network.
+    let prIntent: PrIntent | undefined = deps.prIntent;
+    if (prIntent === undefined && (config.prIntent ?? true) && !("prIntent" in deps)) {
+      prIntent = await fetchPrIntent(pr, auth, fetchImpl);
+    }
+    const prIntentText = renderPrIntent(prIntent) ?? "(none)";
+
+    // ── Per-language CWE / input-validation checklist (feature #5).
+    const securityChecklist = buildSecurityChecklist(kept);
+
     // ── Agentic tool loop setup (6.3): OFF by default; one shared budget per run.
     const agenticOn = config.agentic ?? false;
     const agenticOpts: AgenticOptions | undefined = agenticOn
@@ -493,6 +561,9 @@ export async function runReview(
         CUSTOM_RULES: customRulesText,
         CONTEXT: contextText,
         RETRIEVED_CONTEXT: retrievedText,
+        PR_INTENT: prIntentText,
+        SECURITY_CHECKLIST: securityChecklist,
+        CROSS_FILE_CALLERS: crossFileText,
         TOOLS: toolsText,
       });
 
@@ -531,7 +602,11 @@ export async function runReview(
             notices.push("verification skipped: cost cap");
             earlyStop = true;
           } else if (verifierLoop.response) {
-            const outcome = applyVerdicts(rawFindings, parseVerifierOutput(verifierLoop.response.text));
+            const outcome = applyVerdicts(
+              rawFindings,
+              parseVerifierOutput(verifierLoop.response.text),
+              groundingSource,
+            );
             if (outcome.degraded) {
               notices.push(
                 "verification degraded: verifier output could not be parsed — publishing unverified findings",
@@ -543,6 +618,7 @@ export async function runReview(
               keptCount: outcome.kept.length,
               rewrittenCount: outcome.rewrittenCount,
               dropped: outcome.dropped,
+              ungrounded: outcome.ungrounded,
             };
           }
         }
@@ -553,6 +629,21 @@ export async function runReview(
     }
     if (agenticOpts) agenticUsage = agenticOpts.usage;
   }
+
+  // ── Deterministic security pre-passes (features #2, #4): secret/credential
+  // scan + GitHub Actions workflow supply-chain checks over ADDED diff lines
+  // only. Both skip the LLM/verifier entirely and merge straight into the
+  // normal publish path, so anchoring, dedupe, and suppression still apply.
+  // Merged AFTER the model/verifier block so a leaked key or unpinned action is
+  // still flagged even when the model call failed (degraded) or stopped early.
+  const deterministic: Finding[] = [
+    ...scanSecrets(kept, {
+      allowPaths: repoConfig.secretAllowPaths,
+      allowPatterns: repoConfig.secretAllowPatterns,
+    }),
+    ...checkWorkflows(kept),
+  ];
+  if (deterministic.length > 0) rawFindings = [...rawFindings, ...deterministic];
 
   // ── Suppression (4.1, 4.7, 4.9): do-not-report + house rules + min severity.
   const addedLines: Record<string, readonly number[]> = Object.fromEntries(
@@ -589,9 +680,20 @@ export async function runReview(
     ...existing.reviewComments,
     ...existing.issueComments.map((c) => ({ body: c.body })),
   ];
-  const { kept: fresh, deduped } = dedupeFindings(anchored, dedupeCorpus);
+  const { kept: freshRaw, deduped } = dedupeFindings(anchored, dedupeCorpus);
 
-  const publishable = fresh.filter((a: AnchoredFinding) => a.placement !== "summary").map((a) => a.finding);
+  // ── Intra-run near-duplicate grouping (report item #10): collapse the SAME
+  // issue repeated across files/lines into one representative comment (with an
+  // "Also found in:" list) before posting. Conservative (category + normalized
+  // title); folded members are disclosed in the representative's body.
+  const { kept: grouped } = groupNearDuplicates(freshRaw);
+
+  // ── Severity-first ordering (feature #9d): posted inline comments AND the
+  // summary table both surface critical→nit. Stable sort keeps intra-band order.
+  const fresh = [...grouped].sort((a, b) => bySeverityDesc(a.finding, b.finding));
+
+  const publishableAnchored = fresh.filter((a: AnchoredFinding) => a.placement !== "summary");
+  const publishable = publishableAnchored.map((a) => a.finding);
   const summaryFindings = fresh.filter((a) => a.placement === "summary").map((a) => a.finding);
   const findings = fresh.map((a) => a.finding);
 
@@ -613,12 +715,26 @@ export async function runReview(
     degraded,
     nothingReviewable,
   });
-  const payload = buildReviewPayload(reviewBody, publishable);
+  const payload = buildReviewPayload(reviewBody, publishableAnchored);
 
   // ── One upserted summary comment with hidden marker + state SHA (4.4/4.5).
+  // Feature #9: severity-grouped table (#9a), deterministic risk verdict (#9b,
+  // reusing escalate.ts's risky-path signal), and blob permalinks (#9c).
   const summaryComment = composeSummaryComment({
     headSha: config.event?.headSha,
+    owner: pr.owner,
+    repo: pr.repo,
     findingsPublished: publishable.length + summaryFindings.length,
+    publishedFindings: publishable,
+    risk: {
+      riskyPaths: riskyPaths(kept.map((f) => f.path)),
+      filesChanged: kept.length,
+      linesChanged: kept.reduce(
+        (n, f) =>
+          n + f.hunks.reduce((m, h) => m + h.lines.filter((l) => l.type === "add" || l.type === "del").length, 0),
+        0,
+      ),
+    },
     degraded,
     nothingReviewable,
     summaryFindings,
@@ -629,6 +745,7 @@ export async function runReview(
     notices,
     earlyStop,
     verifierDropped: verification?.dropped ?? [],
+    verifierUngrounded: verification?.ungrounded.length ?? 0,
   });
 
   let posted = false;
@@ -687,6 +804,8 @@ export async function runReview(
         findingsDropped: suppressed.length + deduped.length + (verification?.dropped.length ?? 0),
         dropReasons,
         verifierDropped: verification?.dropped.length ?? 0,
+        abstained: (verification?.dropped ?? []).filter((d) => d.reason === "insufficient-context").length,
+        verifierUngrounded: verification?.ungrounded.length ?? 0,
         escalated,
         incremental: incremental !== undefined,
       },

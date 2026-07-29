@@ -29947,6 +29947,7 @@ exports.agenticComplete = agenticComplete;
  */
 const config_1 = __nccwpck_require__(7454);
 const guardrail_1 = __nccwpck_require__(1547);
+const importgraph_1 = __nccwpck_require__(9305);
 exports.DEFAULT_AGENTIC_CAPS = {
     maxHops: 5,
     maxFileReads: 10,
@@ -30056,13 +30057,33 @@ async function runGrep(call, reader, caps, usage) {
         sections.push("[search stopped: tool budget exhausted]");
     return sections.join("\n");
 }
+async function runFindImporters(call, reader, caps, usage) {
+    const path = call.path;
+    const importers = await (0, importgraph_1.findImporters)(path, reader, caps, usage);
+    const header = `[find_importers ${path}]`;
+    if (importers.length === 0) {
+        const note = usage.cappedOut ? "\n[scan stopped: tool budget exhausted]" : "";
+        return `${header}\nNo importers found (regex scan of TS/JS relative imports).${note}`;
+    }
+    const list = importers.slice(0, MAX_GREP_MATCHES).map((i) => `- ${i.path}`).join("\n");
+    const note = usage.cappedOut
+        ? "\n[scan stopped: tool budget exhausted — this list may be incomplete]"
+        : "";
+    return `${header}\nFiles importing ${path} (${importers.length}):\n${list}${note}`;
+}
 /** Execute one hop's tool calls under the caps; returns the results block. */
 async function executeToolCalls(calls, reader, caps, usage) {
     const parts = [];
     for (const call of calls.slice(0, MAX_CALLS_PER_HOP)) {
-        parts.push(call.tool === "read_file"
-            ? await runReadFile(call.path, reader, caps, usage)
-            : await runGrep(call, reader, caps, usage));
+        if (call.tool === "read_file") {
+            parts.push(await runReadFile(call.path, reader, caps, usage));
+        }
+        else if (call.tool === "find_importers") {
+            parts.push(await runFindImporters(call, reader, caps, usage));
+        }
+        else {
+            parts.push(await runGrep(call, reader, caps, usage));
+        }
     }
     if (calls.length > MAX_CALLS_PER_HOP) {
         parts.push(`[${calls.length - MAX_CALLS_PER_HOP} additional tool call(s) ignored: max ${MAX_CALLS_PER_HOP} per turn]`);
@@ -30194,9 +30215,11 @@ exports.DEFAULT_REPO_CONFIG = {
     minSeverity: "medium",
     ignore: [],
     rules: [],
+    secretAllowPaths: [],
+    secretAllowPatterns: [],
 };
 function freshDefaults() {
-    return { ...exports.DEFAULT_REPO_CONFIG, ignore: [], rules: [] };
+    return { ...exports.DEFAULT_REPO_CONFIG, ignore: [], rules: [], secretAllowPaths: [], secretAllowPatterns: [] };
 }
 const SEVERITIES = ["critical", "high", "medium", "low", "nit"];
 const KEY_VALUE = /^([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(.+)$/;
@@ -30316,6 +30339,21 @@ function parseAireviewToml(text) {
             config.ignore = v;
         else
             problems.push(`"ignore" must be an array of glob strings`);
+    }
+    // Secret pre-pass allowlist (feature #2) — both are arrays of strings.
+    if ("secret_allow_paths" in values) {
+        const v = values.secret_allow_paths;
+        if (Array.isArray(v))
+            config.secretAllowPaths = v;
+        else
+            problems.push(`"secret_allow_paths" must be an array of glob strings`);
+    }
+    if ("secret_allow_patterns" in values) {
+        const v = values.secret_allow_patterns;
+        if (Array.isArray(v))
+            config.secretAllowPatterns = v;
+        else
+            problems.push(`"secret_allow_patterns" must be an array of strings`);
     }
     // Custom rules (task 7.4): unscoped strings via `rules = [...]`...
     if ("rules" in values) {
@@ -30556,6 +30594,8 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.EMPTY_EXISTING = void 0;
 exports.normalizeSubstance = normalizeSubstance;
 exports.isDuplicate = isDuplicate;
+exports.nearDuplicateKey = nearDuplicateKey;
+exports.groupNearDuplicates = groupNearDuplicates;
 exports.dedupeFindings = dedupeFindings;
 exports.fetchExistingComments = fetchExistingComments;
 exports.EMPTY_EXISTING = { reviewComments: [], issueComments: [] };
@@ -30596,6 +30636,66 @@ function isDuplicate(finding, existing, lineTolerance = DEFAULT_LINE_TOLERANCE) 
             return true;
     }
     return false;
+}
+/**
+ * Conservative near-duplicate key (feature #10): category + normalized title.
+ * Two findings share a key only when they are, by title and category, the SAME
+ * issue — so distinct issues (different title OR different category) never
+ * cluster together.
+ */
+function nearDuplicateKey(finding) {
+    return `${finding.category.toLowerCase().trim()}::${normalizeSubstance(finding.title)}`;
+}
+function locationLabel(finding) {
+    return finding.line !== undefined ? `\`${finding.file}\`:${finding.line}` : `\`${finding.file}\``;
+}
+/**
+ * Intra-run near-duplicate grouping (feature #10): cluster findings that are the
+ * SAME issue repeated across files/lines into ONE representative comment, with an
+ * "Also found in:" list of the other locations appended to its body — instead of
+ * posting N near-identical comments. Pure post-processing, runs just before
+ * publishing. Matching is deliberately conservative (identical category +
+ * normalized title), so genuinely different findings are never merged. A cluster
+ * of size one is returned unchanged. Folded members are returned in `folded`
+ * (never silently dropped — they are disclosed in the representative's body).
+ */
+function groupNearDuplicates(candidates) {
+    const clusters = new Map();
+    const order = [];
+    for (const candidate of candidates) {
+        const key = nearDuplicateKey(candidate.finding);
+        const bucket = clusters.get(key);
+        if (bucket) {
+            bucket.push(candidate);
+        }
+        else {
+            clusters.set(key, [candidate]);
+            order.push(key);
+        }
+    }
+    const kept = [];
+    const folded = [];
+    for (const key of order) {
+        const members = clusters.get(key);
+        if (members.length === 1) {
+            kept.push(members[0]);
+            continue;
+        }
+        const [representative, ...rest] = members;
+        const repLabel = locationLabel(representative.finding);
+        const alsoIn = [];
+        for (const member of rest) {
+            folded.push(member.finding);
+            const label = locationLabel(member.finding);
+            if (label !== repLabel && !alsoIn.includes(label))
+                alsoIn.push(label);
+        }
+        const body = alsoIn.length > 0
+            ? `${representative.finding.body}\n\n_Also found in:_ ${alsoIn.join(", ")}`
+            : representative.finding.body;
+        kept.push({ ...representative, finding: { ...representative.finding, body } });
+    }
+    return { kept, folded };
 }
 /** Partition candidates into new findings and already-reported duplicates. */
 function dedupeFindings(candidates, existing, lineTolerance = DEFAULT_LINE_TOLERANCE) {
@@ -30833,6 +30933,7 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.ESCALATION_MODEL = void 0;
 exports.isRiskyPath = isRiskyPath;
 exports.shouldEscalate = shouldEscalate;
+exports.riskyPaths = riskyPaths;
 /** The escalation target, via AnthropicProvider with this model id. */
 exports.ESCALATION_MODEL = "claude-sonnet-5";
 // `auth` must not match "author"; `migrat` covers migration/migrations/migrate;
@@ -30845,6 +30946,14 @@ function isRiskyPath(path) {
 /** True when any changed path in the diff is risky. */
 function shouldEscalate(paths) {
     return paths.some(isRiskyPath);
+}
+/**
+ * The subset of changed paths that look risky. The same signal `shouldEscalate`
+ * uses for model routing, exposed so the summary comment can disclose WHY a PR
+ * is flagged risky (feature #9 risk verdict) instead of discarding it.
+ */
+function riskyPaths(paths) {
+    return paths.filter(isRiskyPath);
 }
 
 
@@ -30991,6 +31100,27 @@ function coerceSeverity(obj) {
         return undefined;
     return SEVERITY_SYNONYMS[raw.toLowerCase()];
 }
+/**
+ * Carry a committable single-line replacement (feature #7). Unlike `firstString`
+ * this PRESERVES the line's own leading indentation (a GitHub suggestion
+ * replaces the whole line, so the indentation is part of the fix) and only
+ * strips a trailing newline. A value that is empty, whitespace-only, or spans
+ * more than one line is rejected — those can never be a clean same-line swap.
+ */
+function coerceSuggestedLine(obj) {
+    for (const key of ["suggestedLine", "suggested_line", "suggestion_line", "replacement", "replacementLine"]) {
+        const v = obj[key];
+        if (typeof v !== "string")
+            continue;
+        const line = v.replace(/\r?\n+$/, ""); // drop trailing newline(s) only
+        if (line.trim().length === 0)
+            continue; // empty / whitespace-only → not a fix
+        if (/\r?\n/.test(line))
+            continue; // multi-line → not a single-line swap
+        return line;
+    }
+    return undefined;
+}
 /** Normalize one raw entry to a Finding, or undefined if it is unsalvageable. */
 function coerceFinding(entry) {
     if (entry === null || typeof entry !== "object" || Array.isArray(entry))
@@ -31014,6 +31144,7 @@ function coerceFinding(entry) {
         title: title ?? body.slice(0, 80),
         body: body ?? title,
         suggestion: firstString(obj, ["suggestion", "fix", "recommendation", "suggested_fix"]),
+        suggestedLine: coerceSuggestedLine(obj),
     };
 }
 /** The guardrail entry point. Pure; never throws. */
@@ -31061,6 +31192,17 @@ function coerceToolCall(entry) {
             return undefined;
         return { tool: "read_file", path };
     }
+    if (name === "find_importers" ||
+        name === "findimporters" ||
+        name === "importers" ||
+        name === "find_callers" ||
+        name === "callers" ||
+        name === "who_imports") {
+        const path = firstString(args, ["path", "file", "filename", "file_path", "filePath", "module"]);
+        if (!path)
+            return undefined;
+        return { tool: "find_importers", path };
+    }
     return undefined;
 }
 /**
@@ -31088,6 +31230,345 @@ function parseToolCalls(raw) {
         return out;
     }
     return undefined;
+}
+
+
+/***/ }),
+
+/***/ 9305:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.MAX_INJECTED_CHARS = exports.MAX_INJECTED_CALL_SITES = exports.DEFAULT_IMPORT_SCAN_CAPS = void 0;
+exports.moduleKey = moduleKey;
+exports.parseImportSpecifiers = parseImportSpecifiers;
+exports.resolveSpecToModuleKey = resolveSpecToModuleKey;
+exports.scanRepoImports = scanRepoImports;
+exports.importersFromScan = importersFromScan;
+exports.findImporters = findImporters;
+exports.extractDecl = extractDecl;
+exports.detectSignatureChanges = detectSignatureChanges;
+exports.collectSignatureChangeCallers = collectSignatureChangeCallers;
+/** A sensible standalone budget for the deterministic whole-repo import scan.
+ *  More generous on file reads than the agentic tool defaults (the scan must
+ *  visit many files to find importers) but still hard-bounded by total bytes. */
+exports.DEFAULT_IMPORT_SCAN_CAPS = {
+    maxHops: 1,
+    maxFileReads: 400,
+    maxTotalBytes: 1024 * 1024,
+};
+/** Cap on total call sites force-injected into the reviewer prompt. */
+exports.MAX_INJECTED_CALL_SITES = 15;
+/** Cap on total characters of the injected cross-file-callers block. */
+exports.MAX_INJECTED_CHARS = 4000;
+/** Cap on call-site lines collected per importing file. */
+const MAX_CALL_SITES_PER_FILE = 5;
+const CODE_EXT = /\.(tsx?|jsx?|mjs|cjs|mts|cts)$/i;
+function isCodeFile(path) {
+    return CODE_EXT.test(path);
+}
+function dirname(path) {
+    const i = path.lastIndexOf("/");
+    return i === -1 ? "" : path.slice(0, i);
+}
+/** Resolve a relative import `spec` against `fromDir` (posix, no fs). */
+function resolveRelative(fromDir, spec) {
+    const parts = fromDir ? fromDir.split("/") : [];
+    const out = [...parts];
+    for (const seg of spec.split("/")) {
+        if (seg === "" || seg === ".")
+            continue;
+        if (seg === "..")
+            out.pop();
+        else
+            out.push(seg);
+    }
+    return out.join("/");
+}
+/** Normalize a path to a module key: strip a code extension and a trailing
+ *  `/index`, so `src/a.ts`, `src/a`, and `src/a/index.ts` all compare equal. */
+function moduleKey(path) {
+    return path.replace(CODE_EXT, "").replace(/\/index$/, "");
+}
+const IMPORT_REGEXES = [
+    // import ... from '...'  /  export ... from '...'
+    /\b(?:import|export)\b[^;\n]*?\bfrom\s*['"]([^'"]+)['"]/g,
+    // side-effect import '...'
+    /\bimport\s*['"]([^'"]+)['"]/g,
+    // require('...')
+    /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
+    // dynamic import('...')
+    /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
+];
+/** All RELATIVE import specifiers in a TS/JS source file (bare/npm specifiers,
+ *  which cannot resolve to a repo file, are ignored). */
+function parseImportSpecifiers(content) {
+    const specs = new Set();
+    for (const re of IMPORT_REGEXES) {
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(content)) !== null) {
+            const spec = m[1];
+            if (spec.startsWith("."))
+                specs.add(spec);
+        }
+    }
+    return [...specs];
+}
+/** The module key a relative `spec` in `importerPath` resolves to, or undefined
+ *  for non-relative (npm) specifiers. */
+function resolveSpecToModuleKey(importerPath, spec) {
+    if (!spec.startsWith("."))
+        return undefined;
+    return moduleKey(resolveRelative(dirname(importerPath), spec));
+}
+/** Scan the whole repo tree ONCE, recording each code file's relative imports.
+ *  Budgeted via the shared usage counter; never throws on I/O. */
+async function scanRepoImports(reader, caps, usage) {
+    const importsByFile = new Map();
+    const contents = new Map();
+    let tree;
+    try {
+        tree = await reader.listTree();
+    }
+    catch {
+        tree = [];
+    }
+    for (const path of tree) {
+        if (!isCodeFile(path))
+            continue;
+        if (usage.fileReads >= caps.maxFileReads || usage.bytesRead >= caps.maxTotalBytes) {
+            usage.cappedOut = true;
+            break;
+        }
+        let content;
+        try {
+            content = await reader.readFile(path);
+        }
+        catch {
+            content = undefined;
+        }
+        if (content === undefined)
+            continue;
+        usage.fileReads += 1;
+        usage.bytesRead += content.length;
+        contents.set(path, content);
+        const keys = [];
+        for (const spec of parseImportSpecifiers(content)) {
+            const key = resolveSpecToModuleKey(path, spec);
+            if (key !== undefined)
+                keys.push(key);
+        }
+        importsByFile.set(path, keys);
+    }
+    return { importsByFile, contents, cappedOut: usage.cappedOut };
+}
+function escapeRe(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function extractCallSites(file, content, symbols) {
+    const alt = symbols.map(escapeRe).join("|");
+    const callRe = new RegExp(`\\b(?:${alt})\\s*\\(`);
+    const sites = [];
+    const lines = content.split("\n");
+    for (let i = 0; i < lines.length && sites.length < MAX_CALL_SITES_PER_FILE; i++) {
+        if (callRe.test(lines[i]))
+            sites.push({ file, line: i + 1, text: lines[i].trim().slice(0, 200) });
+    }
+    return sites;
+}
+/** Filter a completed scan to the files importing `targetPath` (pure). */
+function importersFromScan(scan, targetPath, symbols) {
+    const targetKey = moduleKey(targetPath);
+    const nameRe = symbols && symbols.length > 0
+        ? new RegExp(`\\b(?:${symbols.map(escapeRe).join("|")})\\b`)
+        : undefined;
+    const out = [];
+    for (const [file, keys] of scan.importsByFile) {
+        if (file === targetPath)
+            continue;
+        if (!keys.includes(targetKey))
+            continue;
+        const content = scan.contents.get(file) ?? "";
+        const callSites = symbols && symbols.length > 0 ? extractCallSites(file, content, symbols) : [];
+        const referencesSymbol = callSites.length > 0 || (nameRe ? nameRe.test(content) : false);
+        out.push({ path: file, referencesSymbol, callSites });
+    }
+    out.sort((a, b) => Number(b.referencesSymbol) - Number(a.referencesSymbol) || a.path.localeCompare(b.path));
+    return out;
+}
+/**
+ * Reverse-import lookup for the `find_importers` agentic tool: which files
+ * import `targetPath`. Scans the whole tree under the shared caps/usage. When
+ * `symbols` are given, importers referencing those symbols are ranked first and
+ * carry their call sites.
+ */
+async function findImporters(targetPath, reader, caps, usage, symbols) {
+    const scan = await scanRepoImports(reader, caps, usage);
+    return importersFromScan(scan, targetPath, symbols);
+}
+const METHOD_KEYWORDS = new Set([
+    "if",
+    "for",
+    "while",
+    "switch",
+    "catch",
+    "return",
+    "function",
+    "await",
+    "typeof",
+    "new",
+    "do",
+    "else",
+]);
+/** Keep only the parameter/return portion of a declaration tail: cut at the
+ *  body opener (`{`) or arrow (`=>`), then collapse whitespace. */
+function normalizeSig(tail) {
+    const arrow = tail.indexOf("=>");
+    const brace = tail.indexOf("{");
+    let cut = tail.length;
+    if (arrow !== -1)
+        cut = Math.min(cut, arrow);
+    if (brace !== -1)
+        cut = Math.min(cut, brace);
+    return tail.slice(0, cut).replace(/\s+/g, " ").trim();
+}
+const FN_DECL = /^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*(\(.*)$/;
+const VAR_DECL = /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::\s*[^=]+)?=\s*(.+)$/;
+const VAR_RHS_FN = /^(?:async\s+)?(?:function\b\s*\*?\s*[A-Za-z_$]*\s*)?(\(.*)$/;
+// Guarded method form: requires at least one modifier keyword so a plain
+// function CALL (`foo(1)`) can never be mistaken for a declaration.
+const METHOD_DECL = /^(?:(?:public|private|protected|static|override|abstract|readonly|async|get|set)\s+)+([A-Za-z_$][\w$]*)\s*(\(.*)$/;
+/** Parse a single (trimmed) source line as a signature declaration, or undefined. */
+function extractDecl(rawLine) {
+    const line = rawLine.trim();
+    const fn = FN_DECL.exec(line);
+    if (fn)
+        return { name: fn[1], sig: normalizeSig(fn[2]) };
+    const varm = VAR_DECL.exec(line);
+    if (varm) {
+        const rhs = varm[2];
+        const rhsFn = VAR_RHS_FN.exec(rhs);
+        if (rhsFn && (rhs.includes("=>") || /^(?:async\s+)?function\b/.test(rhs))) {
+            return { name: varm[1], sig: normalizeSig(rhsFn[1]) };
+        }
+        return undefined;
+    }
+    const method = METHOD_DECL.exec(line);
+    if (method && !METHOD_KEYWORDS.has(method[1])) {
+        return { name: method[1], sig: normalizeSig(method[2]) };
+    }
+    return undefined;
+}
+/**
+ * Detect exported/declared function or method signatures whose SHAPE changed in
+ * the diff (same name present on both a removed and an added line, but different
+ * normalized signature). TS/JS only; other files yield nothing.
+ *
+ * Known limitation (accepted): a declaration whose parameter list spans multiple
+ * lines is only detected when the change lands on the declaration's first line.
+ */
+function detectSignatureChanges(files) {
+    const out = [];
+    for (const file of files) {
+        if (!isCodeFile(file.path) || file.isBinary || file.status === "deleted")
+            continue;
+        const removed = new Map();
+        const added = new Map();
+        for (const hunk of file.hunks) {
+            for (const l of hunk.lines) {
+                if (l.type === "del") {
+                    const d = extractDecl(l.content);
+                    if (d && !removed.has(d.name))
+                        removed.set(d.name, d.sig);
+                }
+                else if (l.type === "add") {
+                    const d = extractDecl(l.content);
+                    if (d && !added.has(d.name))
+                        added.set(d.name, d.sig);
+                }
+            }
+        }
+        for (const [name, beforeSig] of removed) {
+            const afterSig = added.get(name);
+            if (afterSig !== undefined && afterSig !== beforeSig) {
+                out.push({ file: file.path, symbol: name, before: beforeSig, after: afterSig });
+            }
+        }
+    }
+    return out;
+}
+const CROSS_FILE_HEADER = "### Cross-file callers of changed signatures (deterministic import-graph scan)\n\n" +
+    "An exported function/method signature changed in this PR. Below are its call\n" +
+    "sites in OTHER files that import it. Check whether each caller still matches the\n" +
+    "NEW signature; if a caller was not updated, report it as a finding anchored to\n" +
+    "the changed signature line in the diff.";
+function renderChangeBlock(change, sites) {
+    const lines = [
+        `**\`${change.symbol}\` in \`${change.file}\`** — signature changed:`,
+        `- before: \`${change.before}\``,
+        `- after:  \`${change.after}\``,
+        "",
+        "Call sites in other files:",
+        ...sites.map((s) => `- \`${s.file}:${s.line}\`: \`${s.text}\``),
+    ];
+    return lines.join("\n");
+}
+/**
+ * Detect signature changes, find their call sites across the repo, and render a
+ * labeled context block for the reviewer prompt — capped and truncation-aware.
+ * Uses one whole-repo scan for all changes. Never throws.
+ */
+async function collectSignatureChangeCallers(files, reader, caps, usage, opts = {}) {
+    const changes = detectSignatureChanges(files);
+    if (changes.length === 0)
+        return { text: "", truncated: false, changes: [] };
+    const maxSites = opts.maxCallSites ?? exports.MAX_INJECTED_CALL_SITES;
+    const maxChars = opts.maxChars ?? exports.MAX_INJECTED_CHARS;
+    const scan = await scanRepoImports(reader, caps, usage);
+    const changedPaths = new Set(files.map((f) => f.path));
+    const blocks = [];
+    const used = [];
+    let siteCount = 0;
+    let chars = 0;
+    let truncated = scan.cappedOut;
+    for (const change of changes) {
+        if (siteCount >= maxSites) {
+            truncated = true;
+            break;
+        }
+        const importers = importersFromScan(scan, change.file, [change.symbol]).filter((i) => i.referencesSymbol && !changedPaths.has(i.path));
+        const sites = [];
+        let cappedThisChange = false;
+        for (const imp of importers) {
+            for (const s of imp.callSites) {
+                if (siteCount >= maxSites) {
+                    cappedThisChange = true;
+                    break;
+                }
+                sites.push(s);
+                siteCount += 1;
+            }
+            if (cappedThisChange)
+                break;
+        }
+        if (cappedThisChange)
+            truncated = true;
+        if (sites.length === 0)
+            continue;
+        const block = renderChangeBlock(change, sites);
+        if (chars + block.length > maxChars) {
+            truncated = true;
+            continue;
+        }
+        blocks.push(block);
+        chars += block.length + 2;
+        used.push(change);
+    }
+    const text = blocks.length > 0 ? [CROSS_FILE_HEADER, ...blocks].join("\n\n") : "";
+    return { text, truncated, changes: used };
 }
 
 
@@ -31220,6 +31701,8 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 __exportStar(__nccwpck_require__(5195), exports);
 __exportStar(__nccwpck_require__(7763), exports);
 __exportStar(__nccwpck_require__(8784), exports);
+__exportStar(__nccwpck_require__(115), exports);
+__exportStar(__nccwpck_require__(8305), exports);
 __exportStar(__nccwpck_require__(2361), exports);
 __exportStar(__nccwpck_require__(2067), exports);
 __exportStar(__nccwpck_require__(9054), exports);
@@ -31234,14 +31717,95 @@ __exportStar(__nccwpck_require__(4738), exports);
 __exportStar(__nccwpck_require__(2961), exports);
 __exportStar(__nccwpck_require__(9606), exports);
 __exportStar(__nccwpck_require__(5931), exports);
+__exportStar(__nccwpck_require__(9305), exports);
 __exportStar(__nccwpck_require__(6573), exports);
 __exportStar(__nccwpck_require__(320), exports);
 __exportStar(__nccwpck_require__(9519), exports);
 __exportStar(__nccwpck_require__(7746), exports);
 __exportStar(__nccwpck_require__(309), exports);
 __exportStar(__nccwpck_require__(7260), exports);
+__exportStar(__nccwpck_require__(1390), exports);
 __exportStar(__nccwpck_require__(815), exports);
 __exportStar(__nccwpck_require__(8573), exports);
+
+
+/***/ }),
+
+/***/ 1390:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.parseLinkedIssues = parseLinkedIssues;
+exports.renderPrIntent = renderPrIntent;
+exports.fetchPrIntent = fetchPrIntent;
+/**
+ * GitHub's own closing keywords, per its docs: close/closes/closed,
+ * fix/fixes/fixed, resolve/resolves/resolved, followed by `#<number>`.
+ */
+const CLOSING_KEYWORDS = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b/gi;
+/** Extract closing-keyword-linked issue numbers from a PR body. Pure. */
+function parseLinkedIssues(body) {
+    if (!body)
+        return [];
+    const out = new Set();
+    for (const match of body.matchAll(CLOSING_KEYWORDS)) {
+        const n = Number(match[1]);
+        if (Number.isInteger(n) && n > 0)
+            out.add(n);
+    }
+    return [...out];
+}
+/**
+ * Render the {{PR_INTENT}} block, or undefined when there is nothing to show
+ * (so run.ts can substitute "(none)" and omit the block per fail-soft). Pure.
+ */
+function renderPrIntent(intent) {
+    if (!intent)
+        return undefined;
+    const parts = [];
+    if (intent.title?.trim())
+        parts.push(`Title: ${intent.title.trim()}`);
+    if (intent.body?.trim())
+        parts.push(`Description:\n${intent.body.trim()}`);
+    if (intent.linkedIssues.length > 0) {
+        parts.push(`Linked issues (closed by this PR): ${intent.linkedIssues.map((n) => `#${n}`).join(", ")}`);
+    }
+    return parts.length > 0 ? parts.join("\n\n") : undefined;
+}
+/**
+ * Fetch the PR's title + body and derive its linked issues. Returns undefined
+ * on any error or when the response is unusable — the caller then omits the
+ * block. Never throws.
+ */
+async function fetchPrIntent(pr, auth, fetchImpl) {
+    const url = `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.prNumber}`;
+    try {
+        const res = await fetchImpl(url, {
+            headers: {
+                accept: "application/vnd.github+json",
+                authorization: `Bearer ${auth}`,
+                "x-github-api-version": "2022-11-28",
+                "user-agent": "code-review-engine",
+            },
+        });
+        if (!res.ok)
+            return undefined;
+        const parsed = JSON.parse(await res.text());
+        if (parsed === null || typeof parsed !== "object")
+            return undefined;
+        const obj = parsed;
+        const title = typeof obj.title === "string" ? obj.title : undefined;
+        const body = typeof obj.body === "string" ? obj.body : undefined;
+        if (title === undefined && body === undefined)
+            return undefined;
+        return { title, body, linkedIssues: parseLinkedIssues(body) };
+    }
+    catch {
+        return undefined;
+    }
+}
 
 
 /***/ }),
@@ -31669,6 +32233,7 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.REVIEWER_PROMPT_FILE = void 0;
 exports.loadPromptTemplate = loadPromptTemplate;
 exports.renderPrompt = renderPrompt;
+exports.buildSecurityChecklist = buildSecurityChecklist;
 exports.formatCommentableLines = formatCommentableLines;
 /**
  * Prompt loading and rendering (design decision 7: prompts are versioned
@@ -31680,8 +32245,8 @@ exports.formatCommentableLines = formatCommentableLines;
  */
 const node_fs_1 = __nccwpck_require__(3024);
 const path = __importStar(__nccwpck_require__(6760));
-/** The engine's default prompt version — M5 ships reviewer-v4 (custom rules + retrieved context). */
-exports.REVIEWER_PROMPT_FILE = "reviewer-v4.md";
+/** The engine's default prompt version — reviewer-v7 (splits fixes into committable `suggestedLine` + prose `suggestion`, report item #7). */
+exports.REVIEWER_PROMPT_FILE = "reviewer-v7.md";
 const USER_MARKER = /^<!--\s*USER\s*-->\s*$/m;
 function candidatePaths(fileName) {
     const candidates = [];
@@ -31719,6 +32284,119 @@ function renderPrompt(template, vars) {
         user = user.split(token).join(value);
     }
     return { system: system.trim(), user: user.trim() };
+}
+// ── Per-language CWE / input-validation checklist (feature #5) ──────────────
+//
+// A static file-extension → language map plus a SHORT curated checklist drawn
+// from the 2025 CWE Top 25 (CISA/MITRE) and the OWASP ASVS validation chapter.
+// Only the languages actually present in the diff are appended to the reviewer
+// system prompt — this is a recall lever (directs the model's attention at the
+// bug classes that dominate real CVEs for that language) kept deliberately
+// terse to avoid token bloat.
+const EXT_LANGUAGE = {
+    ts: "TypeScript/JavaScript",
+    tsx: "TypeScript/JavaScript",
+    mts: "TypeScript/JavaScript",
+    cts: "TypeScript/JavaScript",
+    js: "TypeScript/JavaScript",
+    jsx: "TypeScript/JavaScript",
+    mjs: "TypeScript/JavaScript",
+    cjs: "TypeScript/JavaScript",
+    py: "Python",
+    go: "Go",
+    java: "Java",
+    rb: "Ruby",
+    php: "PHP",
+    cs: "C#",
+    c: "C/C++",
+    h: "C/C++",
+    cc: "C/C++",
+    cpp: "C/C++",
+    cxx: "C/C++",
+    hpp: "C/C++",
+    rs: "Rust",
+    sql: "SQL",
+};
+const LANGUAGE_CHECKLIST = {
+    "TypeScript/JavaScript": [
+        "CWE-79 XSS: request data reaching innerHTML / dangerouslySetInnerHTML / document.write without escaping.",
+        "CWE-89 SQL injection: string-concatenated queries instead of parameterized/prepared statements.",
+        "CWE-94 code injection: eval / new Function / child_process fed request-derived input.",
+        "CWE-639 broken access control: an id/owner from the request used in a lookup without checking it belongs to the caller.",
+        "Input validation: prefer allow-lists; anchor regexes with ^…$; never rely on client-only validation.",
+    ],
+    Python: [
+        "CWE-89 SQL injection: f-string / % / .format queries instead of parameterized ones.",
+        "CWE-78 OS command injection: os.system / subprocess with shell=True on user input.",
+        "CWE-94/502 code & deserialization: eval / exec / pickle / yaml.load on untrusted data.",
+        "CWE-22 path traversal: request-derived paths joined without validation.",
+        "Input validation: prefer allow-lists; anchor regexes with ^…$.",
+    ],
+    Go: [
+        "CWE-89 SQL injection: fmt.Sprintf-built queries instead of parameterized db calls.",
+        "CWE-78 command injection: exec.Command via a shell with untrusted args.",
+        "CWE-22 path traversal: filepath.Join on request input without filepath.Clean + prefix check.",
+        "CWE-703: ignored errors (`_ =`) and unchecked type assertions hiding failures.",
+    ],
+    Java: [
+        "CWE-89 SQL injection: Statement string concatenation instead of PreparedStatement.",
+        "CWE-611 XXE: XML parsers without external-entity resolution disabled.",
+        "CWE-502 deserialization: readObject / ObjectInputStream on untrusted data.",
+        "CWE-22 path traversal: File/Paths built from request input without canonicalization.",
+    ],
+    Ruby: [
+        "CWE-89 SQL injection: string-interpolated where/find_by_sql instead of parameter binding.",
+        "CWE-78 command injection: system / backticks / %x on user input.",
+        "CWE-94: eval / send with request-derived method names.",
+    ],
+    PHP: [
+        "CWE-89 SQL injection: interpolated queries instead of prepared statements (PDO/mysqli).",
+        "CWE-79 XSS: echoing request data without htmlspecialchars.",
+        "CWE-78 command injection: system / exec / shell_exec on user input.",
+        "CWE-98 file inclusion: include/require built from request input.",
+    ],
+    "C#": [
+        "CWE-89 SQL injection: string-concatenated SqlCommand instead of parameters.",
+        "CWE-502 deserialization: BinaryFormatter / unsafe type resolution on untrusted data.",
+        "CWE-22 path traversal: Path.Combine on request input without validation.",
+    ],
+    "C/C++": [
+        "CWE-787/125 out-of-bounds write/read: unchecked indices, memcpy/strcpy without bounds.",
+        "CWE-416 use-after-free / CWE-415 double-free: freed pointers reused or freed twice.",
+        "CWE-190 integer overflow feeding an allocation or length.",
+    ],
+    Rust: [
+        "CWE-676: unnecessary `unsafe` blocks; raw-pointer deref invariants.",
+        "CWE-248: `.unwrap()` / `.expect()` on request-derived Option/Result (panic = DoS).",
+        "CWE-190 integer overflow in release builds (use checked_/saturating_ arithmetic).",
+    ],
+    SQL: [
+        "CWE-89: dynamic SQL built by concatenation; ensure parameterization at the call site.",
+        "Least privilege: DDL/GRANT changes widening access beyond what the change needs.",
+    ],
+};
+function extOf(path) {
+    const dot = path.lastIndexOf(".");
+    return dot === -1 ? "" : path.slice(dot + 1).toLowerCase();
+}
+/**
+ * Build the {{SECURITY_CHECKLIST}} block: curated CWE / input-validation lines
+ * for exactly the languages present in the diff, or "(none)". Pure.
+ */
+function buildSecurityChecklist(files) {
+    const langs = new Set();
+    for (const f of files) {
+        const lang = EXT_LANGUAGE[extOf(f.path)];
+        if (lang)
+            langs.add(lang);
+    }
+    const blocks = [];
+    for (const lang of langs) {
+        const items = LANGUAGE_CHECKLIST[lang];
+        if (items)
+            blocks.push(`**${lang}**\n` + items.map((i) => `- ${i}`).join("\n"));
+    }
+    return blocks.length > 0 ? blocks.join("\n\n") : "(none)";
 }
 /** Compact "file: 1-4, 9, 12-13" rendering of commentable lines per file. */
 function formatCommentableLines(files) {
@@ -31758,14 +32436,46 @@ function compressRanges(sorted) {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.renderSuggestionBlock = renderSuggestionBlock;
 exports.formatFindingComment = formatFindingComment;
 exports.formatFileLevelSections = formatFileLevelSections;
 exports.buildReviewPayload = buildReviewPayload;
 exports.postReview = postReview;
-function formatFindingComment(finding) {
+/**
+ * The GitHub suggestion fence (feature #7). GitHub renders a one-click
+ * "Commit suggestion" button for a fenced block whose info string is exactly
+ * `suggestion`. If the replacement code itself contains a run of backticks the
+ * outer fence MUST be longer than the longest inner run, or the block truncates
+ * early / corrupts (documented GitHub markdown collision). We therefore escalate
+ * the fence to (longest inner backtick run + 1), never fewer than three.
+ */
+function suggestionFence(code) {
+    let longest = 0;
+    for (const run of code.match(/`+/g) ?? [])
+        longest = Math.max(longest, run.length);
+    return "`".repeat(Math.max(3, longest + 1));
+}
+/** Render a committable single-line replacement as a GitHub ```suggestion block. */
+function renderSuggestionBlock(code) {
+    const fence = suggestionFence(code);
+    return `${fence}suggestion\n${code}\n${fence}`;
+}
+/**
+ * Format one finding's comment body. When `committable` is true and the finding
+ * carries a validated single-line `suggestedLine`, the fix is rendered as a
+ * GitHub ```suggestion block (one-click apply); otherwise the free-text
+ * `suggestion` prose is used. `committable` must be set ONLY for a finding
+ * anchored to an EXACT commentable line — a clamped/nearest anchor points at a
+ * different line, so applying a same-line swap there would be wrong.
+ */
+function formatFindingComment(finding, committable = false) {
     let body = `**[${finding.severity}] ${finding.title}**\n\n${finding.body}`;
-    if (finding.suggestion)
+    if (committable && finding.suggestedLine) {
+        body += `\n\n**Suggested fix:**\n${renderSuggestionBlock(finding.suggestedLine)}`;
+    }
+    else if (finding.suggestion) {
         body += `\n\n**Suggested fix:**\n${finding.suggestion}`;
+    }
     return body;
 }
 /**
@@ -31786,15 +32496,24 @@ function formatFileLevelSections(findings) {
     }
     return sections.join("\n\n");
 }
-/** Build the single POST /pulls/{n}/reviews payload for a run. Pure. */
+/**
+ * Build the single POST /pulls/{n}/reviews payload for a run. Pure.
+ *
+ * Takes ANCHORED findings so it knows each one's placement: only an EXACT
+ * ("line") anchor is eligible for a committable ```suggestion block (feature
+ * #7); a "nearest" anchor was clamped to a different line and gets prose only.
+ * Comments are emitted in the given order — the caller sorts severity-first
+ * (feature #9d). File-level ("file") and summary anchors carry no inline line
+ * and are rendered elsewhere (review body / summary comment).
+ */
 function buildReviewPayload(summary, findings) {
     const comments = findings
-        .filter((f) => typeof f.line === "number")
-        .map((f) => ({
-        path: f.file,
-        line: f.line,
+        .filter((a) => (a.placement === "line" || a.placement === "nearest") && typeof a.finding.line === "number")
+        .map((a) => ({
+        path: a.finding.file,
+        line: a.finding.line,
         side: "RIGHT",
-        body: formatFindingComment(f),
+        body: formatFindingComment(a.finding, a.placement === "line"),
     }));
     return { body: summary, event: "COMMENT", comments };
 }
@@ -31881,6 +32600,10 @@ const state_1 = __nccwpck_require__(9519);
 const guardrail_1 = __nccwpck_require__(1547);
 const model_1 = __nccwpck_require__(2067);
 const noise_1 = __nccwpck_require__(8784);
+const importgraph_1 = __nccwpck_require__(9305);
+const secrets_1 = __nccwpck_require__(115);
+const workflowcheck_1 = __nccwpck_require__(8305);
+const intent_1 = __nccwpck_require__(1390);
 const prompt_1 = __nccwpck_require__(9054);
 const scope_1 = __nccwpck_require__(9606);
 const verify_1 = __nccwpck_require__(6573);
@@ -31888,6 +32611,7 @@ const publish_1 = __nccwpck_require__(2841);
 const summary_1 = __nccwpck_require__(4738);
 const suppress_1 = __nccwpck_require__(1847);
 const sizeCap_1 = __nccwpck_require__(2361);
+const types_1 = __nccwpck_require__(5195);
 /** Build the review body headline. Skips and truncation are always disclosed. */
 function buildSummary(parts) {
     const sections = [];
@@ -32151,6 +32875,44 @@ async function runReview(pr, auth, config = {}, deps = {}) {
         const context = (0, scope_1.buildContext)(scopeInputs, expander, { maxTotalChars: config.contextCapChars });
         if (context.truncated)
             notices.push("enclosing-scope context truncated at the char cap");
+        // ── Cross-file caller injection (report item #8): deterministically detect
+        // exported signature changes in the diff and FORCE-inject their call sites
+        // from other files, so a caller left unupdated is surfaced even if the model
+        // wouldn't grep for it. Opt-in (a whole-repo import scan) and fail-soft.
+        let crossFileText = "(none)";
+        if (config.crossFileCallers ?? false) {
+            const reader = deps.repoReader ?? (0, agentic_1.githubRepoReader)(pr, auth, config.event?.headSha, fetchImpl);
+            try {
+                const injected = await (0, importgraph_1.collectSignatureChangeCallers)(kept, reader, { ...importgraph_1.DEFAULT_IMPORT_SCAN_CAPS, ...config.crossFileCaps }, (0, agentic_1.newAgenticUsage)());
+                if (injected.text)
+                    crossFileText = injected.text;
+                if (injected.truncated) {
+                    notices.push("cross-file caller injection truncated at the cap — some call sites may be omitted");
+                }
+            }
+            catch {
+                notices.push("cross-file caller scan failed — continuing without it");
+            }
+        }
+        // ── Grounding source (feature #1): the exact diff-line contents + context
+        // text sent to the model, for the verifier's deterministic quote check.
+        // The injected call sites are part of what the reviewer saw, so include them
+        // so the verifier can ground a caller-mismatch quote.
+        const groundingSource = (0, verify_1.buildGroundingSource)(kept.map((f) => ({
+            path: f.path,
+            lines: f.hunks.flatMap((h) => h.lines
+                .filter((l) => l.newLine !== undefined)
+                .map((l) => ({ line: l.newLine, content: l.content }))),
+        })), crossFileText === "(none)" ? context.text : `${context.text}\n\n${crossFileText}`);
+        // ── PR intent (feature #3): title/body + linked issues, one REST call,
+        // fail-soft (default ON). deps.prIntent (tests) bypasses the network.
+        let prIntent = deps.prIntent;
+        if (prIntent === undefined && (config.prIntent ?? true) && !("prIntent" in deps)) {
+            prIntent = await (0, intent_1.fetchPrIntent)(pr, auth, fetchImpl);
+        }
+        const prIntentText = (0, intent_1.renderPrIntent)(prIntent) ?? "(none)";
+        // ── Per-language CWE / input-validation checklist (feature #5).
+        const securityChecklist = (0, prompt_1.buildSecurityChecklist)(kept);
         // ── Agentic tool loop setup (6.3): OFF by default; one shared budget per run.
         const agenticOn = config.agentic ?? false;
         const agenticOpts = agenticOn
@@ -32191,6 +32953,9 @@ async function runReview(pr, auth, config = {}, deps = {}) {
                 CUSTOM_RULES: customRulesText,
                 CONTEXT: contextText,
                 RETRIEVED_CONTEXT: retrievedText,
+                PR_INTENT: prIntentText,
+                SECURITY_CHECKLIST: securityChecklist,
+                CROSS_FILE_CALLERS: crossFileText,
                 TOOLS: toolsText,
             });
             const loop = await (0, agentic_1.agenticComplete)(model, rendered, tracker, agenticOpts);
@@ -32229,7 +32994,7 @@ async function runReview(pr, auth, config = {}, deps = {}) {
                         earlyStop = true;
                     }
                     else if (verifierLoop.response) {
-                        const outcome = (0, verify_1.applyVerdicts)(rawFindings, (0, verify_1.parseVerifierOutput)(verifierLoop.response.text));
+                        const outcome = (0, verify_1.applyVerdicts)(rawFindings, (0, verify_1.parseVerifierOutput)(verifierLoop.response.text), groundingSource);
                         if (outcome.degraded) {
                             notices.push("verification degraded: verifier output could not be parsed — publishing unverified findings");
                         }
@@ -32239,6 +33004,7 @@ async function runReview(pr, auth, config = {}, deps = {}) {
                             keptCount: outcome.kept.length,
                             rewrittenCount: outcome.rewrittenCount,
                             dropped: outcome.dropped,
+                            ungrounded: outcome.ungrounded,
                         };
                     }
                 }
@@ -32249,6 +33015,21 @@ async function runReview(pr, auth, config = {}, deps = {}) {
         if (agenticOpts)
             agenticUsage = agenticOpts.usage;
     }
+    // ── Deterministic security pre-passes (features #2, #4): secret/credential
+    // scan + GitHub Actions workflow supply-chain checks over ADDED diff lines
+    // only. Both skip the LLM/verifier entirely and merge straight into the
+    // normal publish path, so anchoring, dedupe, and suppression still apply.
+    // Merged AFTER the model/verifier block so a leaked key or unpinned action is
+    // still flagged even when the model call failed (degraded) or stopped early.
+    const deterministic = [
+        ...(0, secrets_1.scanSecrets)(kept, {
+            allowPaths: repoConfig.secretAllowPaths,
+            allowPatterns: repoConfig.secretAllowPatterns,
+        }),
+        ...(0, workflowcheck_1.checkWorkflows)(kept),
+    ];
+    if (deterministic.length > 0)
+        rawFindings = [...rawFindings, ...deterministic];
     // ── Suppression (4.1, 4.7, 4.9): do-not-report + house rules + min severity.
     const addedLines = Object.fromEntries(kept.map((f) => [
         f.path,
@@ -32280,8 +33061,17 @@ async function runReview(pr, auth, config = {}, deps = {}) {
         ...existing.reviewComments,
         ...existing.issueComments.map((c) => ({ body: c.body })),
     ];
-    const { kept: fresh, deduped } = (0, dedupe_1.dedupeFindings)(anchored, dedupeCorpus);
-    const publishable = fresh.filter((a) => a.placement !== "summary").map((a) => a.finding);
+    const { kept: freshRaw, deduped } = (0, dedupe_1.dedupeFindings)(anchored, dedupeCorpus);
+    // ── Intra-run near-duplicate grouping (report item #10): collapse the SAME
+    // issue repeated across files/lines into one representative comment (with an
+    // "Also found in:" list) before posting. Conservative (category + normalized
+    // title); folded members are disclosed in the representative's body.
+    const { kept: grouped } = (0, dedupe_1.groupNearDuplicates)(freshRaw);
+    // ── Severity-first ordering (feature #9d): posted inline comments AND the
+    // summary table both surface critical→nit. Stable sort keeps intra-band order.
+    const fresh = [...grouped].sort((a, b) => (0, types_1.bySeverityDesc)(a.finding, b.finding));
+    const publishableAnchored = fresh.filter((a) => a.placement !== "summary");
+    const publishable = publishableAnchored.map((a) => a.finding);
     const summaryFindings = fresh.filter((a) => a.placement === "summary").map((a) => a.finding);
     const findings = fresh.map((a) => a.finding);
     // ── Still-open carry-forward (7.3). On an incremental run, persisted open
@@ -32301,11 +33091,21 @@ async function runReview(pr, auth, config = {}, deps = {}) {
         degraded,
         nothingReviewable,
     });
-    const payload = (0, publish_1.buildReviewPayload)(reviewBody, publishable);
+    const payload = (0, publish_1.buildReviewPayload)(reviewBody, publishableAnchored);
     // ── One upserted summary comment with hidden marker + state SHA (4.4/4.5).
+    // Feature #9: severity-grouped table (#9a), deterministic risk verdict (#9b,
+    // reusing escalate.ts's risky-path signal), and blob permalinks (#9c).
     const summaryComment = (0, summary_1.composeSummaryComment)({
         headSha: config.event?.headSha,
+        owner: pr.owner,
+        repo: pr.repo,
         findingsPublished: publishable.length + summaryFindings.length,
+        publishedFindings: publishable,
+        risk: {
+            riskyPaths: (0, escalate_1.riskyPaths)(kept.map((f) => f.path)),
+            filesChanged: kept.length,
+            linesChanged: kept.reduce((n, f) => n + f.hunks.reduce((m, h) => m + h.lines.filter((l) => l.type === "add" || l.type === "del").length, 0), 0),
+        },
         degraded,
         nothingReviewable,
         summaryFindings,
@@ -32316,6 +33116,7 @@ async function runReview(pr, auth, config = {}, deps = {}) {
         notices,
         earlyStop,
         verifierDropped: verification?.dropped ?? [],
+        verifierUngrounded: verification?.ungrounded.length ?? 0,
     });
     let posted = false;
     if (!config.dryRun) {
@@ -32371,6 +33172,8 @@ async function runReview(pr, auth, config = {}, deps = {}) {
             findingsDropped: suppressed.length + deduped.length + (verification?.dropped.length ?? 0),
             dropReasons,
             verifierDropped: verification?.dropped.length ?? 0,
+            abstained: (verification?.dropped ?? []).filter((d) => d.reason === "insufficient-context").length,
+            verifierUngrounded: verification?.ungrounded.length ?? 0,
             escalated,
             incremental: incremental !== undefined,
         }, deps.runLogIo);
@@ -32467,6 +33270,8 @@ function summarizeRunLog(records) {
         findingsDropped: 0,
         dropReasons: {},
         verifierDropped: 0,
+        abstained: 0,
+        verifierUngrounded: 0,
         escalatedRuns: 0,
         incrementalRuns: 0,
         byModel: {},
@@ -32478,6 +33283,8 @@ function summarizeRunLog(records) {
         summary.findingsKept += r.findingsKept || 0;
         summary.findingsDropped += r.findingsDropped || 0;
         summary.verifierDropped += r.verifierDropped || 0;
+        summary.abstained += r.abstained || 0;
+        summary.verifierUngrounded += r.verifierUngrounded || 0;
         if (r.escalated)
             summary.escalatedRuns += 1;
         if (r.incremental)
@@ -32704,6 +33511,178 @@ function buildContext(inputs, expander, opts = {}) {
         }
     }
     return { text: blocks.join("\n\n"), truncated };
+}
+
+
+/***/ }),
+
+/***/ 115:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.GENERIC_MIN_LENGTH = exports.GENERIC_MIN_ENTROPY = void 0;
+exports.shannonEntropy = shannonEntropy;
+exports.redactSecret = redactSecret;
+exports.detectSecretsInLine = detectSecretsInLine;
+exports.scanSecrets = scanSecrets;
+/**
+ * Deterministic secret / credential pre-pass (feature #2, report item #2).
+ *
+ * A zero-dependency regex (+ Shannon-entropy) scanner run over the ADDED lines
+ * of the diff ONLY, BEFORE the LLM call — same deterministic-filter spirit as
+ * noise.ts. It emits `critical` / `secret` Findings with the secret VALUE
+ * redacted (only a short prefix is shown), so a leaked credential is caught
+ * even when the model skims past this "boring" kind of line, and WITHOUT an
+ * LLM round-trip (these findings skip the reviewer + verifier entirely).
+ *
+ * Precision controls (this pass must not cry wolf — it feeds the same publish
+ * path as every other finding, so a false positive is a real posted comment):
+ *   - named formats (AWS / GitHub / Slack / Stripe / Google / PEM / JWT) are
+ *     matched by shape and are near-zero-false-positive on their own;
+ *   - the generic "secret-like variable = long string" detector additionally
+ *     requires a minimum length, high Shannon entropy, no interpolation, and
+ *     rejects obvious placeholders;
+ *   - any value containing "EXAMPLE" (the AWS/GitHub docs convention) is skipped;
+ *   - a per-repo allowlist (path globs + literal substrings) silences known-safe
+ *     matches such as test fixtures / documented example keys — see
+ *     `secret_allow_paths` / `secret_allow_patterns` in .aireview.toml.
+ */
+const config_1 = __nccwpck_require__(7454);
+/** Minimum Shannon entropy (bits/char) for the generic assignment detector. */
+exports.GENERIC_MIN_ENTROPY = 3.0;
+/** Minimum value length for the generic assignment detector. */
+exports.GENERIC_MIN_LENGTH = 16;
+/**
+ * High-signal named-credential formats. Each regex is global; the whole match
+ * is the sensitive value. Ordered most-specific first — the per-line dedupe
+ * keeps only the first detector to claim a given value.
+ */
+const NAMED = [
+    { label: "AWS access key ID", regex: /\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[0-9A-Z]{16}\b/g },
+    { label: "GitHub fine-grained token", regex: /\bgithub_pat_[0-9A-Za-z_]{22,}\b/g },
+    { label: "GitHub token", regex: /\bgh[opsur]_[0-9A-Za-z]{36,}\b/g },
+    { label: "Slack token", regex: /\bxox[baprs]-[0-9A-Za-z-]{10,}\b/g },
+    { label: "Stripe secret key", regex: /\b[sr]k_live_[0-9A-Za-z]{16,}\b/g },
+    { label: "Google API key", regex: /\bAIza[0-9A-Za-z_-]{35}\b/g },
+    { label: "private key block", regex: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/g },
+    { label: "JSON Web Token (JWT)", regex: /eyJ[0-9A-Za-z_-]{10,}\.eyJ[0-9A-Za-z_-]{6,}\.[0-9A-Za-z_-]{6,}/g },
+];
+/**
+ * Generic "credential-shaped assignment": a variable whose name reads like a
+ * secret, assigned a quoted literal. Group 1 = name, group 2 = value.
+ */
+const GENERIC = /["'`]?([A-Za-z0-9_]*(?:passwd|password|pwd|secret|api[_-]?key|apikey|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|token))["'`]?\s*[:=]>?\s*["'`]([^"'`]{12,})["'`]/gi;
+/** Interpolation / env-lookup markers — a value that reads from elsewhere is not a literal secret. */
+const INTERPOLATION = /\$\{|\{\{|%\(|<[^>]{0,60}>|process\.env|os\.environ|import\.meta\.env|getenv\(/;
+/** Obvious placeholder words — distinctive enough that a real secret rarely contains them. */
+const PLACEHOLDER = /example|changeme|change[_-]?me|placeholder|redacted|dummy|sample|your[_-]?(?:key|token|secret|password|api)|yourkey|xxxxx|fixme|todo|foobar|lorem|replace[_-]?me/i;
+/** Shannon entropy of a string, in bits per character. Pure. */
+function shannonEntropy(text) {
+    if (text.length === 0)
+        return 0;
+    const freq = new Map();
+    for (const ch of text)
+        freq.set(ch, (freq.get(ch) ?? 0) + 1);
+    let entropy = 0;
+    for (const count of freq.values()) {
+        const p = count / text.length;
+        entropy -= p * Math.log2(p);
+    }
+    return entropy;
+}
+/** Redact a secret value: keep only a 4-char prefix, disclose the length. */
+function redactSecret(value) {
+    const keep = value.slice(0, Math.min(4, value.length));
+    return `${keep}…(${value.length} chars, redacted)`;
+}
+/** All distinct credential matches on a single (already marker-stripped) line. */
+function detectSecretsInLine(line) {
+    const out = [];
+    const seen = new Set();
+    const push = (label, value) => {
+        if (value.length === 0 || seen.has(value))
+            return;
+        seen.add(value);
+        out.push({ label, value });
+    };
+    for (const detector of NAMED) {
+        detector.regex.lastIndex = 0;
+        let m;
+        while ((m = detector.regex.exec(line)) !== null) {
+            push(detector.label, m[0]);
+            if (m.index === detector.regex.lastIndex)
+                detector.regex.lastIndex += 1;
+        }
+    }
+    GENERIC.lastIndex = 0;
+    let g;
+    while ((g = GENERIC.exec(line)) !== null) {
+        const value = g[2];
+        if (value.length >= exports.GENERIC_MIN_LENGTH &&
+            !INTERPOLATION.test(value) &&
+            !PLACEHOLDER.test(value) &&
+            shannonEntropy(value) >= exports.GENERIC_MIN_ENTROPY) {
+            push("hardcoded secret", value);
+        }
+        if (g.index === GENERIC.lastIndex)
+            GENERIC.lastIndex += 1;
+    }
+    return out;
+}
+function isAllowedValue(value, line, allow) {
+    const patterns = allow.allowPatterns ?? [];
+    const v = value.toLowerCase();
+    const l = line.toLowerCase();
+    return patterns.some((p) => {
+        const needle = p.toLowerCase();
+        return needle.length > 0 && (v.includes(needle) || l.includes(needle));
+    });
+}
+function makeFinding(file, line, match) {
+    return {
+        severity: "critical",
+        category: "secret",
+        file,
+        line,
+        title: `Possible ${match.label} committed`,
+        body: `A value matching the ${match.label} pattern was found on this added line ` +
+            `(\`${redactSecret(match.value)}\`). If this is a real credential, revoke and ` +
+            `rotate it now, remove it from the diff history, and load it from an environment ` +
+            `variable or secret manager instead of committing it. If it is a non-sensitive ` +
+            `example or test fixture, add this path to \`secret_allow_paths\` or the literal to ` +
+            `\`secret_allow_patterns\` in .aireview.toml to silence this check.`,
+    };
+}
+/**
+ * Scan the ADDED lines of the given diff files for committed secrets. Pure and
+ * deterministic — no LLM call. Deleted/binary files and allowlisted paths are
+ * skipped. Every finding is `critical` / `secret` with the value redacted.
+ */
+function scanSecrets(files, allow = {}) {
+    const allowPaths = allow.allowPaths ?? [];
+    const findings = [];
+    for (const file of files) {
+        if (file.isBinary || file.status === "deleted")
+            continue;
+        if (allowPaths.some((glob) => (0, config_1.globMatch)(glob, file.path)))
+            continue;
+        for (const hunk of file.hunks) {
+            for (const dl of hunk.lines) {
+                if (dl.type !== "add" || dl.newLine === undefined)
+                    continue;
+                for (const match of detectSecretsInLine(dl.content)) {
+                    if (/example/i.test(match.value))
+                        continue; // AWS/GitHub docs convention
+                    if (isAllowedValue(match.value, dl.content, allow))
+                        continue;
+                    findings.push(makeFinding(file.path, dl.newLine, match));
+                }
+            }
+        }
+    }
+    return findings;
 }
 
 
@@ -33006,7 +33985,7 @@ function buildStatsComment(stats) {
 /***/ }),
 
 /***/ 4738:
-/***/ ((__unused_webpack_module, exports) => {
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
 
@@ -33016,6 +33995,7 @@ exports.renderStateMarker = renderStateMarker;
 exports.findSummaryComment = findSummaryComment;
 exports.composeSummaryComment = composeSummaryComment;
 exports.upsertSummaryComment = upsertSummaryComment;
+const types_1 = __nccwpck_require__(5195);
 exports.SUMMARY_MARKER = "<!-- ai-review-bot:summary -->";
 const STATE_MARKER = /<!--\s*ai-review-bot:state\s+(\{[\s\S]*?\})\s*-->/;
 function renderStateMarker(state) {
@@ -33045,9 +34025,105 @@ function findSummaryComment(issueComments) {
     }
     return undefined;
 }
-const severityLine = (f) => `- \`${f.file}\`${f.line !== undefined ? `:${f.line}` : ""} — **[${f.severity}]** ${f.title}: ${f.body}`;
+const SEVERITY_EMOJI = {
+    critical: "🔴",
+    high: "🟠",
+    medium: "🟡",
+    low: "🔵",
+    nit: "⚪",
+};
+/** A static GitHub blob permalink at the reviewed SHA (no fetch needed). Pure. */
+function blobUrl(link, file, line) {
+    if (!link.owner || !link.repo || !link.headSha)
+        return undefined;
+    const anchor = line !== undefined ? `#L${line}` : "";
+    return `https://github.com/${link.owner}/${link.repo}/blob/${link.headSha}/${file}${anchor}`;
+}
+/** `` `file`:line `` as a markdown link to the blob when identity is known (#9c). */
+function locationMd(link, file, line) {
+    const label = `\`${file}\`${line !== undefined ? `:${line}` : ""}`;
+    const url = blobUrl(link, file, line);
+    return url ? `[${label}](${url})` : label;
+}
+const bulletLine = (link) => (f) => `- ${locationMd(link, f.file, f.line)} — **[${f.severity}]** ${f.title}: ${f.body}`;
+/** Deterministic 1–5 review-effort estimate from diff size (#9b). Pure. */
+function reviewEffort(filesChanged, linesChanged) {
+    let score = 1;
+    if (linesChanged > 20)
+        score += 1;
+    if (linesChanged > 75)
+        score += 1;
+    if (linesChanged > 200)
+        score += 1;
+    if (linesChanged > 500)
+        score += 1;
+    if (filesChanged > 10)
+        score += 1;
+    return Math.min(5, score);
+}
+function baseName(path) {
+    const parts = path.split("/");
+    return parts[parts.length - 1] || path;
+}
+/**
+ * The at-a-glance risk verdict + review-effort line (#9b). Deterministic: level
+ * is driven by critical findings and risky paths; effort by diff size. Pure.
+ */
+function composeRiskLine(risk, findings) {
+    const criticals = findings.filter((f) => f.severity === "critical").length;
+    const highs = findings.filter((f) => f.severity === "high").length;
+    let emoji;
+    let level;
+    if (criticals > 0) {
+        emoji = "🔴";
+        level = "high";
+    }
+    else if (risk.riskyPaths.length > 0 || highs > 0) {
+        emoji = "🟠";
+        level = "elevated";
+    }
+    else {
+        emoji = "🟢";
+        level = "low";
+    }
+    const reasons = [];
+    if (risk.riskyPaths.length > 0) {
+        const names = [...new Set(risk.riskyPaths.map(baseName))];
+        const shown = names.slice(0, 3).join(", ");
+        reasons.push(`touches sensitive paths (${shown}${names.length > 3 ? ", …" : ""})`);
+    }
+    const findingBits = [];
+    if (criticals > 0)
+        findingBits.push(`${criticals} critical`);
+    if (highs > 0)
+        findingBits.push(`${highs} high`);
+    if (findingBits.length > 0)
+        reasons.push(`${findingBits.join(", ")} finding(s)`);
+    const effort = reviewEffort(risk.filesChanged, risk.linesChanged);
+    const reasonText = reasons.length > 0 ? ` (${reasons.join("; ")})` : "";
+    return `**Risk:** ${emoji} ${level}${reasonText} · **Est. review effort:** ${effort}/5`;
+}
+/**
+ * Severity-grouped findings table (#9a): one scannable table sorted
+ * critical→nit, each row severity-badged with a clickable location. Collapsed
+ * behind a `<details>` block once the list is long, so large PRs stay readable.
+ * Pure.
+ */
+function composeFindingsTable(link, findings) {
+    const sorted = [...findings].sort(types_1.bySeverityDesc);
+    const rows = sorted
+        .map((f) => `| ${SEVERITY_EMOJI[f.severity]} ${f.severity} | ${locationMd(link, f.file, f.line)} | ${f.category} | ${f.title} |`)
+        .join("\n");
+    const table = `| Severity | Location | Category | Finding |\n| --- | --- | --- | --- |\n${rows}`;
+    if (sorted.length > 10) {
+        return `<details>\n<summary><strong>${sorted.length} findings</strong> (click to expand)</summary>\n\n${table}\n\n</details>`;
+    }
+    return table;
+}
 /** Compose the single upserted summary comment. Pure. */
 function composeSummaryComment(parts) {
+    const link = { owner: parts.owner, repo: parts.repo, headSha: parts.headSha };
+    const renderBullet = bulletLine(link);
     const sections = [exports.SUMMARY_MARKER];
     if (parts.degraded) {
         sections.push("## 🤖 AI review summary\n\n⚠️ The review model returned output that could not be parsed as findings; no inline comments this run.");
@@ -33061,6 +34137,14 @@ function composeSummaryComment(parts) {
     else {
         sections.push(`## 🤖 AI review summary\n\nFound ${parts.findingsPublished} new issue(s) this run.`);
     }
+    // Deterministic at-a-glance risk verdict (#9b) — reuses signals already computed.
+    if (parts.risk && !parts.degraded && !parts.nothingReviewable) {
+        sections.push(composeRiskLine(parts.risk, parts.publishedFindings ?? []));
+    }
+    // Severity-grouped, severity-first findings table (#9a/#9d).
+    if (parts.publishedFindings && parts.publishedFindings.length > 0) {
+        sections.push(composeFindingsTable(link, parts.publishedFindings));
+    }
     for (const notice of parts.notices)
         sections.push(`⚠️ ${notice}`);
     if (parts.earlyStop) {
@@ -33068,17 +34152,31 @@ function composeSummaryComment(parts) {
     }
     if (parts.summaryFindings.length > 0) {
         sections.push("**Findings that could not be attached to the diff** (file not in the diff view):\n" +
-            parts.summaryFindings.map(severityLine).join("\n"));
+            parts.summaryFindings.map(renderBullet).join("\n"));
     }
     if (parts.stillOpen.length > 0) {
         sections.push("**Still open from previous runs** (already reported, not re-posted inline):\n" +
-            parts.stillOpen.map(severityLine).join("\n"));
+            parts.stillOpen.map(renderBullet).join("\n"));
     }
     if (parts.verifierDropped && parts.verifierDropped.length > 0) {
-        sections.push(`**Dropped by verification** (${parts.verifierDropped.length}):\n` +
-            parts.verifierDropped
-                .map((d) => `- \`${d.finding.file}\` — **[${d.reason}]** ${d.finding.title} (evidence: ${d.evidence})`)
-                .join("\n"));
+        // Abstentions (feature #6) are disclosed distinctly from genuine drops:
+        // "noticed but could not confirm" is not the same as "this was a false positive".
+        const abstained = parts.verifierDropped.filter((d) => d.reason === "insufficient-context");
+        const rejected = parts.verifierDropped.filter((d) => d.reason !== "insufficient-context");
+        if (rejected.length > 0) {
+            sections.push(`**Dropped by verification** (${rejected.length}):\n` +
+                rejected
+                    .map((d) => `- \`${d.finding.file}\` — **[${d.reason}]** ${d.finding.title} (evidence: ${d.evidence})`)
+                    .join("\n"));
+        }
+        if (abstained.length > 0) {
+            sections.push(`**Could not confirm — insufficient context** (${abstained.length}):\n` +
+                abstained.map((d) => `- \`${d.finding.file}\` — ${d.finding.title}`).join("\n"));
+        }
+    }
+    if (parts.verifierUngrounded && parts.verifierUngrounded > 0) {
+        sections.push(`⚠️ The verifier could not ground its cited evidence for ${parts.verifierUngrounded} verdict(s); ` +
+            "those findings were kept but treat them as lower-confidence.");
     }
     if (parts.suppressed.length > 0) {
         const byReason = new Map();
@@ -33213,6 +34311,8 @@ function applySuppressions(findings, opts = {}) {
 /** Core engine types, shared across modules. */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.atLeastSeverity = atLeastSeverity;
+exports.severityRank = severityRank;
+exports.bySeverityDesc = bySeverityDesc;
 const SEVERITY_RANK = {
     critical: 4,
     high: 3,
@@ -33224,6 +34324,19 @@ const SEVERITY_RANK = {
 function atLeastSeverity(a, b) {
     return SEVERITY_RANK[a] >= SEVERITY_RANK[b];
 }
+/** Numeric rank of a severity (critical highest). Exposed for ordering. */
+function severityRank(s) {
+    return SEVERITY_RANK[s];
+}
+/**
+ * Comparator: most-severe first (critical → nit). Stable when fed to
+ * Array.prototype.sort (ES2019+), so equal-severity findings keep their
+ * original relative order — used for severity-first comment/table ordering
+ * (feature #9d).
+ */
+function bySeverityDesc(a, b) {
+    return SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity];
+}
 
 
 /***/ }),
@@ -33234,8 +34347,11 @@ function atLeastSeverity(a, b) {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.DROP_REASONS = exports.VERIFIER_PROMPT_FILE = void 0;
+exports.ABSTAIN_REASON = exports.DROP_REASONS = exports.VERIFIER_PROMPT_FILE = void 0;
 exports.parseVerifierOutput = parseVerifierOutput;
+exports.parseCitation = parseCitation;
+exports.buildGroundingSource = buildGroundingSource;
+exports.checkGrounding = checkGrounding;
 exports.applyVerdicts = applyVerdicts;
 exports.formatFindingsForVerifier = formatFindingsForVerifier;
 /**
@@ -33251,14 +34367,17 @@ exports.formatFindingsForVerifier = formatFindingsForVerifier;
  * (task 6.8) proves the verifier kills ≥30% of raw findings correctly.
  */
 const guardrail_1 = __nccwpck_require__(1547);
-exports.VERIFIER_PROMPT_FILE = "verifier-v1.md";
+exports.VERIFIER_PROMPT_FILE = "verifier-v2.md";
 exports.DROP_REASONS = [
     "false-claim",
     "pre-existing",
     "repo-convention",
     "out-of-scope",
     "theoretically-impossible",
+    "insufficient-context",
 ];
+/** The verifier abstention reason (feature #6) — evidence is not required for it. */
+exports.ABSTAIN_REASON = "insufficient-context";
 const VERDICT_SYNONYMS = {
     keep: "keep",
     accept: "keep",
@@ -33354,14 +34473,97 @@ function parseVerifierOutput(raw) {
     }
     return decisions;
 }
+const CITATION_RE = /([A-Za-z0-9_./+-]+\.[A-Za-z0-9]+):(\d+)/;
+/** Split an evidence string into `{ file, line, quote }`. Pure. */
+function parseCitation(evidence) {
+    const match = CITATION_RE.exec(evidence);
+    if (!match) {
+        const quote = evidence.trim();
+        return { quote: quote.length > 0 ? quote : undefined };
+    }
+    const after = evidence
+        .slice(match.index + match[0].length)
+        .replace(/^[\s:—–-]+/, "")
+        .trim();
+    return { file: match[1], line: Number(match[2]), quote: after.length > 0 ? after : undefined };
+}
+/** Build a GroundingSource from the diff line contents + context text. Pure. */
+function buildGroundingSource(files, contextText = "") {
+    const byFile = {};
+    for (const f of files) {
+        (byFile[f.path] ??= []).push(...f.lines.map((l) => ({ line: l.line, content: l.content })));
+    }
+    return { byFile, contextText };
+}
+function normalize(s) {
+    return s.replace(/\s+/g, " ").trim().toLowerCase();
+}
+/** Strip wrapping quotes/backticks the model may put around the excerpt. */
+function stripDelims(s) {
+    return s.replace(/^[`'"]+/, "").replace(/[`'"]+$/, "").trim();
+}
+function fileLines(source, file) {
+    if (source.byFile[file])
+        return source.byFile[file];
+    // Loose match by basename — models sometimes cite a shortened path.
+    const base = file.slice(file.lastIndexOf("/") + 1);
+    for (const [path, lines] of Object.entries(source.byFile)) {
+        if (path.slice(path.lastIndexOf("/") + 1) === base)
+            return lines;
+    }
+    return undefined;
+}
+const MIN_QUOTE_LEN = 4;
+const DEFAULT_WINDOW = 3;
+/**
+ * Mechanically check whether an evidence string's quote appears in the payload
+ * sent to the model. Prefers a match within ±window lines of the cited
+ * file:line, then anywhere in that file, then anywhere in the whole payload
+ * (a lenient fallback that keeps the FLAG's own precision high — we only report
+ * "quote-not-found" when the excerpt is genuinely absent). Pure.
+ */
+function checkGrounding(evidence, source, window = DEFAULT_WINDOW) {
+    const cit = parseCitation(evidence);
+    const quote = cit.quote ? normalize(stripDelims(cit.quote)) : undefined;
+    if (!quote || quote.length < MIN_QUOTE_LEN)
+        return "no-citation";
+    if (cit.file && cit.line !== undefined) {
+        const lines = fileLines(source, cit.file);
+        if (lines) {
+            const near = lines
+                .filter((l) => Math.abs(l.line - cit.line) <= window)
+                .map((l) => l.content)
+                .join(" ");
+            if (normalize(near).includes(quote))
+                return "grounded";
+            const whole = lines.map((l) => l.content).join(" ");
+            if (normalize(whole).includes(quote))
+                return "grounded";
+        }
+    }
+    const haystack = normalize([...Object.values(source.byFile).flatMap((ls) => ls.map((l) => l.content)), source.contextText].join(" "));
+    return haystack.includes(quote) ? "grounded" : "quote-not-found";
+}
 /**
  * Apply verdicts to the findings (1-based ids matching prompt order). Pure.
+ *
  * Fail-open rules: no decision for a finding → keep; drop without a valid
  * reason AND evidence → keep; rewrite without rewritten text → keep as-is.
+ *
+ * Grounding (feature #1): the verifier must cite evidence on EVERY verdict.
+ * When `source` is supplied, the cited quote is mechanically checked:
+ *   - keep / rewrite with missing or fabricated evidence → still KEPT, but
+ *     flagged in `ungrounded` (the verifier's rubber stamp isn't trusted).
+ *   - drop (a real false-positive reason) with a FABRICATED quote → demoted
+ *     back to a keep and flagged, so a hallucinated citation can never kill a
+ *     genuine finding.
+ * Abstention (feature #6): a drop whose reason is `insufficient-context` is the
+ * verifier saying "noticed but could not ground it" — recorded distinctly in
+ * `dropped` (evidence optional, no grounding requirement).
  */
-function applyVerdicts(findings, decisions) {
+function applyVerdicts(findings, decisions, source) {
     if (decisions === undefined) {
-        return { kept: [...findings], dropped: [], rewrittenCount: 0, degraded: true };
+        return { kept: [...findings], dropped: [], rewrittenCount: 0, ungrounded: [], degraded: true };
     }
     const byId = new Map();
     for (const d of decisions)
@@ -33369,36 +34571,265 @@ function applyVerdicts(findings, decisions) {
             byId.set(d.id, d);
     const kept = [];
     const dropped = [];
+    const ungrounded = [];
     let rewrittenCount = 0;
+    // Flag a kept verdict (keep/rewrite) when its evidence is missing or fabricated.
+    const flagKept = (finding, decision, verdict) => {
+        if (!decision.evidence) {
+            ungrounded.push({ finding, verdict, reason: "missing-evidence" });
+            return;
+        }
+        if (source && checkGrounding(decision.evidence, source) === "quote-not-found") {
+            ungrounded.push({ finding, verdict, reason: "quote-not-found" });
+        }
+    };
     findings.forEach((finding, i) => {
         const decision = byId.get(i + 1);
         if (!decision || decision.verdict === "keep") {
+            if (decision)
+                flagKept(finding, decision, "keep");
             kept.push(finding);
             return;
         }
         if (decision.verdict === "rewrite") {
-            if (decision.rewritten) {
-                kept.push({ ...finding, body: decision.rewritten });
+            const rewritten = decision.rewritten ? { ...finding, body: decision.rewritten } : finding;
+            if (decision.rewritten)
                 rewrittenCount += 1;
-            }
-            else {
-                kept.push(finding);
-            }
+            flagKept(rewritten, decision, "rewrite");
+            kept.push(rewritten);
             return;
         }
-        // drop — only with a closed-enum reason AND cited evidence.
+        // drop
+        if (decision.reason === exports.ABSTAIN_REASON) {
+            // Abstention: kept out of the published set but logged distinctly. Evidence
+            // is optional here — the whole point is the model could NOT ground it.
+            dropped.push({
+                finding,
+                reason: exports.ABSTAIN_REASON,
+                evidence: decision.evidence ?? "(abstained — could not ground the claim in the diff/context)",
+            });
+            return;
+        }
+        // A genuine false-positive drop needs a closed-enum reason AND evidence...
         if (decision.reason && decision.evidence) {
-            dropped.push({ finding, reason: decision.reason, evidence: decision.evidence });
+            // ...and the quote must not be fabricated — a hallucinated citation must
+            // never be allowed to kill a real finding.
+            if (source && checkGrounding(decision.evidence, source) === "quote-not-found") {
+                ungrounded.push({ finding, verdict: "drop", reason: "quote-not-found" });
+                kept.push(finding);
+            }
+            else {
+                dropped.push({ finding, reason: decision.reason, evidence: decision.evidence });
+            }
         }
         else {
             kept.push(finding);
         }
     });
-    return { kept, dropped, rewrittenCount, degraded: false };
+    return { kept, dropped, rewrittenCount, ungrounded, degraded: false };
 }
 /** Render the numbered findings JSON sent to the verifier ({{FINDINGS}}). */
 function formatFindingsForVerifier(findings) {
     return JSON.stringify(findings.map((f, i) => ({ id: i + 1, ...f })), null, 2);
+}
+
+
+/***/ }),
+
+/***/ 8305:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.isWorkflowFile = isWorkflowFile;
+exports.checkWorkflows = checkWorkflows;
+const WORKFLOW_PATH = /^\.github\/workflows\/[^/]+\.ya?ml$/;
+/** Action owners trusted to use tag refs (GitHub's own first-party actions). */
+const TRUSTED_OWNERS = new Set(["actions", "github"]);
+const USES = /^\s*(?:-\s*)?uses:\s*["']?([^"'#\s]+)["']?/;
+const SHA = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/i;
+/** PR-head checkout refs that make `pull_request_target` dangerous. */
+const HEAD_CHECKOUT = /ref:\s*["']?\$\{\{\s*[^}]*(?:github\.event\.pull_request\.head\.(?:sha|ref)|github\.head_ref)[^}]*\}\}/i;
+const RUN_KEY = /^(\s*)(?:-\s*)?run:\s?(.*)$/;
+const INTERP = /\$\{\{([^}]*)\}\}/g;
+/** Attacker-controllable expression contexts (whitespace removed, lowercased). */
+const UNTRUSTED_CONTEXTS = [
+    "github.event.issue.title",
+    "github.event.issue.body",
+    "github.event.pull_request.title",
+    "github.event.pull_request.body",
+    "github.event.comment.body",
+    "github.event.review.body",
+    "github.event.review_comment.body",
+    "github.event.discussion.title",
+    "github.event.discussion.body",
+    "github.event.head_commit.message",
+    "github.event.commits",
+    "github.event.pull_request.head.ref",
+    "github.event.pull_request.head.label",
+    "github.head_ref",
+    "github.event.pages",
+];
+function isWorkflowFile(path) {
+    return WORKFLOW_PATH.test(path);
+}
+/** New-side (added + context) lines of a hunk, in order, with added flags. */
+function newSideLines(hunk) {
+    const out = [];
+    for (const l of hunk.lines) {
+        if (l.newLine === undefined)
+            continue; // deletions have no new-side line
+        out.push({ newLine: l.newLine, content: l.content, added: l.type === "add" });
+    }
+    return out;
+}
+function indentOf(text) {
+    const m = /^(\s*)/.exec(text);
+    return m ? m[1].length : 0;
+}
+function firstUntrusted(line) {
+    INTERP.lastIndex = 0;
+    let m;
+    while ((m = INTERP.exec(line)) !== null) {
+        const expr = m[1].replace(/\s+/g, "").toLowerCase();
+        if (UNTRUSTED_CONTEXTS.some((c) => expr.includes(c)))
+            return m[0];
+        if (m.index === INTERP.lastIndex)
+            INTERP.lastIndex += 1;
+    }
+    return undefined;
+}
+function unpinnedActionFinding(file, line, ref) {
+    if (ref.startsWith("./") || ref.startsWith("../") || ref.startsWith(".") || ref.startsWith("docker://")) {
+        return undefined; // local action / docker ref — not a third-party tag pin
+    }
+    const at = ref.lastIndexOf("@");
+    if (at === -1)
+        return undefined; // no version pin at all (local reusable workflow, etc.)
+    const nameRef = ref.slice(0, at);
+    const version = ref.slice(at + 1);
+    const owner = nameRef.split("/")[0]?.toLowerCase();
+    if (owner && TRUSTED_OWNERS.has(owner))
+        return undefined;
+    if (SHA.test(version))
+        return undefined; // already pinned to a commit SHA
+    return {
+        severity: "high",
+        category: "supply-chain",
+        file,
+        line,
+        title: `Unpinned third-party action: ${nameRef}`,
+        body: `\`${ref}\` pins to the mutable ref \`${version}\`, which a compromised or malicious ` +
+            `upstream can silently repoint to hostile code that then runs with this workflow's ` +
+            `permissions. Pin third-party actions to a full-length commit SHA instead, e.g. ` +
+            `\`uses: ${nameRef}@<40-char-sha> # ${version}\`, so the exact reviewed code is what runs.`,
+    };
+}
+function pwnRequestFinding(file, lines) {
+    const targetLine = lines.find((l) => /pull_request_target/.test(l.content));
+    if (!targetLine)
+        return undefined;
+    const checkoutLines = lines.filter((l) => HEAD_CHECKOUT.test(l.content));
+    if (checkoutLines.length === 0)
+        return undefined;
+    const involvedAdded = targetLine.added || checkoutLines.some((l) => l.added);
+    if (!involvedAdded)
+        return undefined; // wholly pre-existing config — not this diff's change
+    const addedCheckout = checkoutLines.find((l) => l.added);
+    const anchor = addedCheckout ?? (targetLine.added ? targetLine : undefined);
+    return {
+        severity: "critical",
+        category: "security",
+        file,
+        line: anchor?.newLine,
+        title: "pull_request_target workflow checks out untrusted PR head code",
+        body: "This workflow triggers on `pull_request_target` (which runs with the base repo's " +
+            "secrets and a read/write token) AND checks out the PR's head ref. Code from a fork " +
+            "PR would then execute with full access to those secrets — the classic \"pwn request\" " +
+            "pattern. Use the `pull_request` trigger instead, or do not check out / build / run the " +
+            "PR head under `pull_request_target`; only handle untrusted code in a sandboxed job that " +
+            "has no secrets.",
+    };
+}
+function injectionFindings(file, lines) {
+    const findings = [];
+    let runIndent = null;
+    for (const l of lines) {
+        const runMatch = RUN_KEY.exec(l.content);
+        if (runMatch) {
+            runIndent = indentOf(l.content);
+            // Inline `run: echo ${{ ... }}` — the expression is on the run: line itself.
+            const inline = runMatch[2];
+            if (l.added && inline) {
+                const expr = firstUntrusted(inline);
+                if (expr)
+                    findings.push(injectionFinding(file, l.newLine, expr));
+            }
+            continue;
+        }
+        if (runIndent === null)
+            continue;
+        if (l.content.trim().length === 0)
+            continue; // blank line stays inside the block
+        if (indentOf(l.content) <= runIndent) {
+            runIndent = null; // dedented out of the run: block
+            continue;
+        }
+        if (!l.added)
+            continue;
+        const expr = firstUntrusted(l.content);
+        if (expr)
+            findings.push(injectionFinding(file, l.newLine, expr));
+    }
+    return findings;
+}
+function injectionFinding(file, line, expr) {
+    return {
+        severity: "critical",
+        category: "security",
+        file,
+        line,
+        title: "Untrusted input interpolated into a workflow run: script",
+        body: `\`${expr}\` is attacker-controllable (a PR/issue title or body, a comment, or a branch ` +
+            `name) and is interpolated directly into a shell \`run:\` block, allowing script injection ` +
+            `into the runner. Pass it through an intermediate \`env:\` variable and reference it quoted ` +
+            `(e.g. \`"$TITLE"\`) in the script, or consume it as an action input — never inline a ` +
+            `\`\${{ github.event.* }}\` expression into the shell.`,
+    };
+}
+/**
+ * Run all workflow supply-chain checks over the changed workflow files in the
+ * given diff. Pure and deterministic — no LLM call, no network.
+ */
+function checkWorkflows(files) {
+    const findings = [];
+    for (const file of files) {
+        if (file.isBinary || file.status === "deleted" || !isWorkflowFile(file.path))
+            continue;
+        const allNewLines = [];
+        for (const hunk of file.hunks) {
+            const lines = newSideLines(hunk);
+            allNewLines.push(...lines);
+            // (a) unpinned actions + (c) run: injection are scoped per hunk.
+            for (const l of lines) {
+                if (!l.added)
+                    continue;
+                const uses = USES.exec(l.content);
+                if (uses) {
+                    const finding = unpinnedActionFinding(file.path, l.newLine, uses[1]);
+                    if (finding)
+                        findings.push(finding);
+                }
+            }
+            findings.push(...injectionFindings(file.path, lines));
+        }
+        // (b) pwn-request needs the whole file's visible new-side context.
+        const pwn = pwnRequestFinding(file.path, allNewLines);
+        if (pwn)
+            findings.push(pwn);
+    }
+    return findings;
 }
 
 

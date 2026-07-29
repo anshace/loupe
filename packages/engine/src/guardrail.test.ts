@@ -158,6 +158,42 @@ describe("parseModelFindings", () => {
   });
 });
 
+describe("parseModelFindings — committable suggestedLine (feature #7)", () => {
+  it("carries suggestedLine, preserving the line's own leading indentation", () => {
+    const res = parseModelFindings(JSON.stringify([{ ...VALID, suggestedLine: "    return a + b;" }]));
+    expect(res.findings[0].suggestedLine).toBe("    return a + b;");
+  });
+
+  it("accepts snake_case and `replacement` synonyms", () => {
+    expect(parseModelFindings(JSON.stringify([{ ...VALID, suggested_line: "x = 1;" }])).findings[0].suggestedLine).toBe(
+      "x = 1;",
+    );
+    expect(parseModelFindings(JSON.stringify([{ ...VALID, replacement: "y = 2;" }])).findings[0].suggestedLine).toBe(
+      "y = 2;",
+    );
+  });
+
+  it("strips only a trailing newline", () => {
+    expect(parseModelFindings(JSON.stringify([{ ...VALID, suggestedLine: "z = 3;\n" }])).findings[0].suggestedLine).toBe(
+      "z = 3;",
+    );
+  });
+
+  it("rejects a multi-line value — it can never be a clean single-line swap", () => {
+    const res = parseModelFindings(JSON.stringify([{ ...VALID, suggestedLine: "line1\nline2" }]));
+    expect(res.findings[0].suggestedLine).toBeUndefined();
+  });
+
+  it("rejects empty / whitespace-only values", () => {
+    expect(parseModelFindings(JSON.stringify([{ ...VALID, suggestedLine: "   " }])).findings[0].suggestedLine).toBeUndefined();
+    expect(parseModelFindings(JSON.stringify([{ ...VALID, suggestedLine: "" }])).findings[0].suggestedLine).toBeUndefined();
+  });
+
+  it("is undefined when the model emits no committable line", () => {
+    expect(parseModelFindings(JSON.stringify([VALID])).findings[0].suggestedLine).toBeUndefined();
+  });
+});
+
 describe("parseToolCalls (task 6.3)", () => {
   it("parses grep and read_file requests", () => {
     const out = parseToolCalls(

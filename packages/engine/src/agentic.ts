@@ -15,6 +15,7 @@ import type { FetchLike } from "./diff";
 import type { CostTracker } from "./cost";
 import { parseToolCalls } from "./guardrail";
 import type { ToolCallRequest } from "./guardrail";
+import { findImporters } from "./importgraph";
 import type { ModelResponse, ReviewModel } from "./model";
 import type { RenderedPrompt } from "./prompt";
 import type { AgenticCaps, AgenticUsage, AuthToken, PrIdentity } from "./types";
@@ -155,6 +156,26 @@ async function runGrep(
   return sections.join("\n");
 }
 
+async function runFindImporters(
+  call: ToolCallRequest,
+  reader: RepoReader,
+  caps: Required<AgenticCaps>,
+  usage: AgenticUsage,
+): Promise<string> {
+  const path = call.path as string;
+  const importers = await findImporters(path, reader, caps, usage);
+  const header = `[find_importers ${path}]`;
+  if (importers.length === 0) {
+    const note = usage.cappedOut ? "\n[scan stopped: tool budget exhausted]" : "";
+    return `${header}\nNo importers found (regex scan of TS/JS relative imports).${note}`;
+  }
+  const list = importers.slice(0, MAX_GREP_MATCHES).map((i) => `- ${i.path}`).join("\n");
+  const note = usage.cappedOut
+    ? "\n[scan stopped: tool budget exhausted — this list may be incomplete]"
+    : "";
+  return `${header}\nFiles importing ${path} (${importers.length}):\n${list}${note}`;
+}
+
 /** Execute one hop's tool calls under the caps; returns the results block. */
 export async function executeToolCalls(
   calls: readonly ToolCallRequest[],
@@ -164,11 +185,13 @@ export async function executeToolCalls(
 ): Promise<string> {
   const parts: string[] = [];
   for (const call of calls.slice(0, MAX_CALLS_PER_HOP)) {
-    parts.push(
-      call.tool === "read_file"
-        ? await runReadFile(call.path as string, reader, caps, usage)
-        : await runGrep(call, reader, caps, usage),
-    );
+    if (call.tool === "read_file") {
+      parts.push(await runReadFile(call.path as string, reader, caps, usage));
+    } else if (call.tool === "find_importers") {
+      parts.push(await runFindImporters(call, reader, caps, usage));
+    } else {
+      parts.push(await runGrep(call, reader, caps, usage));
+    }
   }
   if (calls.length > MAX_CALLS_PER_HOP) {
     parts.push(`[${calls.length - MAX_CALLS_PER_HOP} additional tool call(s) ignored: max ${MAX_CALLS_PER_HOP} per turn]`);

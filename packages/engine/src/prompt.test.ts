@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { DiffFile } from "./diff";
-import { formatCommentableLines, loadPromptTemplate, renderPrompt } from "./prompt";
+import { buildSecurityChecklist, formatCommentableLines, loadPromptTemplate, renderPrompt } from "./prompt";
 
 describe("loadPromptTemplate", () => {
-  it("loads the default reviewer prompt (v4) from the repo prompts/ folder", () => {
+  it("loads the default reviewer prompt (v7) from the repo prompts/ folder", () => {
     const template = loadPromptTemplate();
     expect(template).toContain("Severity rubric");
     expect(template).toContain("Do NOT report");
@@ -13,6 +13,9 @@ describe("loadPromptTemplate", () => {
     expect(template).toContain("{{CUSTOM_RULES}}");
     expect(template).toContain("{{CONTEXT}}");
     expect(template).toContain("{{RETRIEVED_CONTEXT}}");
+    expect(template).toContain("{{PR_INTENT}}");
+    expect(template).toContain("{{SECURITY_CHECKLIST}}");
+    expect(template).toContain("{{CROSS_FILE_CALLERS}}");
     expect(template).toContain("{{TOOLS}}");
   });
 
@@ -47,6 +50,9 @@ describe("renderPrompt", () => {
       CUSTOM_RULES: "(none)",
       CONTEXT: "(none)",
       RETRIEVED_CONTEXT: "(none)",
+      PR_INTENT: "(none)",
+      SECURITY_CHECKLIST: "(none)",
+      CROSS_FILE_CALLERS: "(none)",
       TOOLS: "disabled",
     });
     expect(system).toContain("Severity rubric");
@@ -82,5 +88,25 @@ describe("formatCommentableLines", () => {
 
   it("reports when nothing is commentable", () => {
     expect(formatCommentableLines([file("gone.txt", [])])).toBe("(no commentable lines)");
+  });
+});
+
+describe("buildSecurityChecklist (feature #5)", () => {
+  it("emits a per-language checklist only for languages present in the diff", () => {
+    const out = buildSecurityChecklist([{ path: "src/a.ts" }, { path: "svc/main.py" }]);
+    expect(out).toContain("**TypeScript/JavaScript**");
+    expect(out).toContain("**Python**");
+    expect(out).toContain("CWE-89");
+    expect(out).not.toContain("**Go**");
+  });
+
+  it("de-duplicates a language across many files of the same kind", () => {
+    const out = buildSecurityChecklist([{ path: "a.ts" }, { path: "b.tsx" }, { path: "c.js" }]);
+    expect(out.match(/\*\*TypeScript\/JavaScript\*\*/g)).toHaveLength(1);
+  });
+
+  it("returns (none) when no known language is present", () => {
+    expect(buildSecurityChecklist([{ path: "README.md" }, { path: "data.csv" }])).toBe("(none)");
+    expect(buildSecurityChecklist([])).toBe("(none)");
   });
 });

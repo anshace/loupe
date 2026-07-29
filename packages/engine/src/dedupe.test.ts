@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { ExistingComment } from "./dedupe";
-import { dedupeFindings, fetchExistingComments, isDuplicate, normalizeSubstance } from "./dedupe";
+import {
+  dedupeFindings,
+  fetchExistingComments,
+  groupNearDuplicates,
+  isDuplicate,
+  nearDuplicateKey,
+  normalizeSubstance,
+} from "./dedupe";
 import type { FetchLike } from "./diff";
 import type { Finding } from "./types";
 
@@ -63,6 +70,60 @@ describe("dedupeFindings", () => {
     );
     expect(kept.map((c) => c.finding.title)).toEqual(["New issue"]);
     expect(deduped).toEqual([finding]);
+  });
+});
+
+describe("groupNearDuplicates (feature #10)", () => {
+  const base: Finding = { severity: "high", category: "security", file: "a.ts", line: 1, title: "Missing input validation", body: "trusts req." };
+
+  it("collapses the same issue repeated across files into one representative with an 'also found in' list", () => {
+    const { kept, folded } = groupNearDuplicates([
+      { finding: base },
+      { finding: { ...base, file: "b.ts", line: 20 } },
+      { finding: { ...base, file: "c.ts", line: 5 } },
+    ]);
+    expect(kept).toHaveLength(1);
+    expect(kept[0].finding.file).toBe("a.ts"); // first is the representative
+    expect(kept[0].finding.body).toContain("Also found in:");
+    expect(kept[0].finding.body).toContain("`b.ts`:20");
+    expect(kept[0].finding.body).toContain("`c.ts`:5");
+    expect(folded.map((f) => f.file)).toEqual(["b.ts", "c.ts"]);
+  });
+
+  it("does NOT merge distinct issues (different title)", () => {
+    const { kept, folded } = groupNearDuplicates([
+      { finding: base },
+      { finding: { ...base, file: "b.ts", title: "Null pointer deref" } },
+    ]);
+    expect(kept).toHaveLength(2);
+    expect(folded).toEqual([]);
+    expect(kept.every((k) => !k.finding.body.includes("Also found in"))).toBe(true);
+  });
+
+  it("does NOT merge same-title findings in different categories", () => {
+    const { kept } = groupNearDuplicates([
+      { finding: base },
+      { finding: { ...base, file: "b.ts", category: "maintainability" } },
+    ]);
+    expect(kept).toHaveLength(2);
+  });
+
+  it("treats titles differing only in case/punctuation as the same issue", () => {
+    expect(nearDuplicateKey(base)).toBe(nearDuplicateKey({ ...base, title: "Missing Input Validation!" }));
+  });
+
+  it("leaves a single finding unchanged (no 'also found in' noise)", () => {
+    const { kept, folded } = groupNearDuplicates([{ finding: base }]);
+    expect(kept).toEqual([{ finding: base }]);
+    expect(folded).toEqual([]);
+  });
+
+  it("preserves sibling fields on the representative (e.g. placement)", () => {
+    const { kept } = groupNearDuplicates([
+      { finding: base, placement: "line" as const },
+      { finding: { ...base, file: "b.ts", line: 9 }, placement: "nearest" as const },
+    ]);
+    expect(kept[0].placement).toBe("line");
   });
 });
 

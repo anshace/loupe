@@ -381,6 +381,63 @@ describe("runReview — repo config (4.6–4.8)", () => {
   });
 });
 
+describe("runReview — committable suggestions & summary polish (features #7, #9)", () => {
+  it("renders a committable ```suggestion block for an exact-anchor finding (#7)", async () => {
+    const model = new MockProvider(
+      JSON.stringify([
+        {
+          severity: "high",
+          category: "bug",
+          file: "src/app.ts",
+          line: 4,
+          title: "Wrong operator",
+          body: "Uses - instead of +.",
+          suggestedLine: "  return a + b;",
+        },
+      ]),
+    );
+    const { posts, deps } = capture();
+    await run({ event: { headSha: "abc123" } }, { ...deps, fetchImpl: diffFetch(MODIFIED_FILE_DIFF), model });
+    expect(posts[0].comments[0].line).toBe(4);
+    expect(posts[0].comments[0].body).toContain("```suggestion\n  return a + b;\n```");
+  });
+
+  it("does NOT emit a suggestion block when the anchor was clamped to a nearest line (#7)", async () => {
+    const model = new MockProvider(
+      JSON.stringify([
+        {
+          severity: "high",
+          category: "bug",
+          file: "src/app.ts",
+          line: 9, // not commentable → clamps to nearest (7)
+          title: "Wrong operator",
+          body: "b",
+          suggestedLine: "return a + b;",
+        },
+      ]),
+    );
+    const { posts, deps } = capture();
+    await run({ event: { headSha: "abc123" } }, { ...deps, fetchImpl: diffFetch(MODIFIED_FILE_DIFF), model });
+    expect(posts[0].comments[0].line).toBe(7); // clamped
+    expect(posts[0].comments[0].body).not.toContain("```suggestion");
+  });
+
+  it("adds a severity table, a risk verdict, and blob permalinks to the summary (#9)", async () => {
+    const model = new MockProvider(
+      JSON.stringify([
+        { severity: "high", category: "bug", file: "src/app.ts", line: 4, title: "Wrong operator", body: "b" },
+      ]),
+    );
+    const { upserts, deps } = capture();
+    await run({ event: { headSha: "abc123" } }, { ...deps, fetchImpl: diffFetch(MODIFIED_FILE_DIFF), model });
+    const body = upserts[0].body;
+    expect(body).toContain("| Severity | Location | Category | Finding |");
+    expect(body).toContain("**Risk:**");
+    expect(body).toContain("**Est. review effort:**");
+    expect(body).toContain("https://github.com/anshace/demo/blob/abc123/src/app.ts#L4");
+  });
+});
+
 describe("runReview — house rules (4.9)", () => {
   const HOUSE_RULES = "We intentionally use magic numbers in tests.\nsuppress: magic number";
 

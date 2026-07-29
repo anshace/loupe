@@ -115,6 +115,25 @@ function coerceSeverity(obj: Record<string, unknown>): Severity | undefined {
   return SEVERITY_SYNONYMS[raw.toLowerCase()];
 }
 
+/**
+ * Carry a committable single-line replacement (feature #7). Unlike `firstString`
+ * this PRESERVES the line's own leading indentation (a GitHub suggestion
+ * replaces the whole line, so the indentation is part of the fix) and only
+ * strips a trailing newline. A value that is empty, whitespace-only, or spans
+ * more than one line is rejected — those can never be a clean same-line swap.
+ */
+function coerceSuggestedLine(obj: Record<string, unknown>): string | undefined {
+  for (const key of ["suggestedLine", "suggested_line", "suggestion_line", "replacement", "replacementLine"]) {
+    const v = obj[key];
+    if (typeof v !== "string") continue;
+    const line = v.replace(/\r?\n+$/, ""); // drop trailing newline(s) only
+    if (line.trim().length === 0) continue; // empty / whitespace-only → not a fix
+    if (/\r?\n/.test(line)) continue; // multi-line → not a single-line swap
+    return line;
+  }
+  return undefined;
+}
+
 /** Normalize one raw entry to a Finding, or undefined if it is unsalvageable. */
 function coerceFinding(entry: unknown): Finding | undefined {
   if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return undefined;
@@ -138,6 +157,7 @@ function coerceFinding(entry: unknown): Finding | undefined {
     title: title ?? (body as string).slice(0, 80),
     body: body ?? (title as string),
     suggestion: firstString(obj, ["suggestion", "fix", "recommendation", "suggested_fix"]),
+    suggestedLine: coerceSuggestedLine(obj),
   };
 }
 
@@ -169,10 +189,10 @@ export function parseModelFindings(raw: string): GuardrailResult {
  * malformed entries, never throw.
  */
 export interface ToolCallRequest {
-  tool: "grep" | "read_file";
+  tool: "grep" | "read_file" | "find_importers";
   /** grep: the regex/substring to search for. */
   pattern?: string;
-  /** grep: optional path prefix filter; read_file: the file to read. */
+  /** grep: optional path prefix filter; read_file / find_importers: the file. */
   path?: string;
 }
 
@@ -199,6 +219,18 @@ function coerceToolCall(entry: unknown): ToolCallRequest | undefined {
     const path = firstString(args, ["path", "file", "filename", "file_path", "filePath"]);
     if (!path) return undefined;
     return { tool: "read_file", path };
+  }
+  if (
+    name === "find_importers" ||
+    name === "findimporters" ||
+    name === "importers" ||
+    name === "find_callers" ||
+    name === "callers" ||
+    name === "who_imports"
+  ) {
+    const path = firstString(args, ["path", "file", "filename", "file_path", "filePath", "module"]);
+    if (!path) return undefined;
+    return { tool: "find_importers", path };
   }
   return undefined;
 }

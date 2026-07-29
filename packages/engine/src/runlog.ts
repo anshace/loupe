@@ -26,6 +26,13 @@ export interface RunLogRecord {
   /** Histogram of drop reasons (suppression reasons, "duplicate", "verifier:<reason>"). */
   dropReasons: Record<string, number>;
   verifierDropped: number;
+  /**
+   * Findings the verifier abstained on (feature #6): noticed but could not
+   * ground → recorded DISTINCTLY from "no issue found". Subset of verifierDropped.
+   */
+  abstained: number;
+  /** Verifier verdicts whose cited evidence failed the mechanical grounding check (feature #1). */
+  verifierUngrounded: number;
   /** True when the run was escalated to the risky-path model. */
   escalated: boolean;
   /** True when the run reviewed an incremental before..after range. */
@@ -81,6 +88,8 @@ export interface RunLogSummary {
   /** Merged drop-reason histogram across all runs. */
   dropReasons: Record<string, number>;
   verifierDropped: number;
+  abstained: number;
+  verifierUngrounded: number;
   escalatedRuns: number;
   incrementalRuns: number;
   /** Run count per model. */
@@ -98,6 +107,8 @@ export function summarizeRunLog(records: readonly RunLogRecord[]): RunLogSummary
     findingsDropped: 0,
     dropReasons: {},
     verifierDropped: 0,
+    abstained: 0,
+    verifierUngrounded: 0,
     escalatedRuns: 0,
     incrementalRuns: 0,
     byModel: {},
@@ -109,6 +120,8 @@ export function summarizeRunLog(records: readonly RunLogRecord[]): RunLogSummary
     summary.findingsKept += r.findingsKept || 0;
     summary.findingsDropped += r.findingsDropped || 0;
     summary.verifierDropped += r.verifierDropped || 0;
+    summary.abstained += r.abstained || 0;
+    summary.verifierUngrounded += r.verifierUngrounded || 0;
     if (r.escalated) summary.escalatedRuns += 1;
     if (r.incremental) summary.incrementalRuns += 1;
     if (r.model) summary.byModel[r.model] = (summary.byModel[r.model] ?? 0) + 1;
