@@ -2,31 +2,31 @@
 
 ## 1. Project Setup
 
-- [ ] 1.1 Initialize TypeScript monorepo workspace (npm workspaces): root `package.json`, `tsconfig.json` base, strict mode, vitest for tests
-- [ ] 1.2 Create `packages/engine` as a pure library package with the trigger-agnostic entry signature `(prIdentity, authToken, config)` and no GitHub-trigger imports; stub types for `Finding`, `ReviewResult`, `RunOptions`
-- [ ] 1.3 Create `prompts/` folder for versioned markdown prompt files with a naming/versioning convention documented in a short header comment of the first file
-- [ ] 1.4 Create a local test repository (separate folder, own git init) with seed source files for generating dummy PRs; document the dummy-PR workflow in `docs/`
-- [ ] 1.5 Set up lint/typecheck/test scripts at the root and verify `npm run build && npm test` passes on the empty skeleton
+- [x] 1.1 Initialize TypeScript monorepo workspace (npm workspaces): root `package.json`, `tsconfig.json` base, strict mode, vitest for tests
+- [x] 1.2 Create `packages/engine` as a pure library package with the trigger-agnostic entry signature `(prIdentity, authToken, config)` and no GitHub-trigger imports; stub types for `Finding`, `ReviewResult`, `RunOptions`
+- [x] 1.3 Create `prompts/` folder for versioned markdown prompt files with a naming/versioning convention documented in a short header comment of the first file
+- [x] 1.4 Create a local test repository (separate folder, own git init) with seed source files for generating dummy PRs; document the dummy-PR workflow in `docs/`
+- [x] 1.5 Set up lint/typecheck/test scripts at the root and verify `npm run build && npm test` passes on the empty skeleton
 
 ## 2. M0 — Hello-World Action
 
-- [ ] 2.1 Write `.github/workflows/review.yml` for the test repo triggering on `pull_request` types `opened`, `synchronize`, `reopened`, `ready_for_review`, with a least-privilege `permissions:` block for `GITHUB_TOKEN`
-- [ ] 2.2 Create `packages/action` wrapper: ~50-line script that reads the event payload and extracts PR number, head SHA, file count, +/- line stats
-- [ ] 2.3 Post a static stats comment ("review bot was here — N files, +X/−Y") via `GITHUB_TOKEN` using `@actions/github`, going through the engine package boundary (adapter calls engine, engine returns comment body)
+- [x] 2.1 Write `.github/workflows/review.yml` for the test repo triggering on `pull_request` types `opened`, `synchronize`, `reopened`, `ready_for_review`, with a least-privilege `permissions:` block for `GITHUB_TOKEN`
+- [x] 2.2 Create `packages/action` wrapper: ~50-line script that reads the event payload and extracts PR number, head SHA, file count, +/- line stats
+- [x] 2.3 Post a static stats comment ("review bot was here — N files, +X/−Y") via `GITHUB_TOKEN` using `@actions/github`, going through the engine package boundary (adapter calls engine, engine returns comment body)
 - [ ] 2.4 Verify: opening a dummy PR on the test repo produces the comment within ~1 min using only `GITHUB_TOKEN`; re-running the workflow does not crash
 
 ## 3. M1 — Real Single-Pass Review
 
-- [ ] 3.1 Implement diff fetching in the engine via the GitHub API (`Accept: application/vnd.github.diff`) for a PR identity + token
-- [ ] 3.2 Implement unified-diff parser: files → hunks with valid new-side (right-side) line numbers, producing the set of commentable lines per file
-- [ ] 3.3 Implement noise-file filter (lockfiles, generated, vendored, binary) applied before any model call, returning a skipped-file count for the summary
-- [ ] 3.4 Implement diff size cap: deterministic truncation with a machine-readable record of what was excluded (files/portions), for disclosure in the summary — never silent
-- [ ] 3.5 Define the thin `ReviewModel` provider interface (prompt in → raw text out + real token counts) and implement the Gemini 2.5 Flash free-tier provider behind it
-- [ ] 3.6 Write `prompts/reviewer-v1.md`: severity rubric (critical/high/medium/low/nit), required JSON findings schema `{severity, category, file, line, title, body, suggestion?}`, and the valid commentable line ranges injected as an explicit constraint
-- [ ] 3.7 Implement the defensive JSON guardrail: tolerate alternate key names and bare lists, drop individually malformed findings while keeping valid ones, degrade to summary-only on fully unparseable output — a run never terminates with an unhandled failure on bad model output (unit tests for each failure shape)
-- [ ] 3.8 Implement line clamping: findings anchored outside valid diff lines are clamped to the nearest valid line or reclassified file-level, without erroring the run
-- [ ] 3.9 Implement batched review posting: all inline findings in ONE `POST /pulls/{n}/reviews` call with an overall body — exactly one review per run
-- [ ] 3.10 Handle the clean-PR path: zero findings above threshold completes with a "no issues found" summary
+- [x] 3.1 Implement diff fetching in the engine via the GitHub API (`Accept: application/vnd.github.diff`) for a PR identity + token
+- [x] 3.2 Implement unified-diff parser: files → hunks with valid new-side (right-side) line numbers, producing the set of commentable lines per file
+- [x] 3.3 Implement noise-file filter (lockfiles, generated, vendored, binary) applied before any model call, returning a skipped-file count for the summary
+- [x] 3.4 Implement diff size cap: deterministic truncation with a machine-readable record of what was excluded (files/portions), for disclosure in the summary — never silent
+- [x] 3.5 Define the thin `ReviewModel` provider interface (prompt in → raw text out + real token counts) and implement the Gemini 2.5 Flash free-tier provider behind it
+- [x] 3.6 Write `prompts/reviewer-v1.md`: severity rubric (critical/high/medium/low/nit), required JSON findings schema `{severity, category, file, line, title, body, suggestion?}`, and the valid commentable line ranges injected as an explicit constraint
+- [x] 3.7 Implement the defensive JSON guardrail: tolerate alternate key names and bare lists, drop individually malformed findings while keeping valid ones, degrade to summary-only on fully unparseable output — a run never terminates with an unhandled failure on bad model output (unit tests for each failure shape)
+- [x] 3.8 Implement line clamping: findings anchored outside valid diff lines are clamped to the nearest valid line or reclassified file-level, without erroring the run
+- [x] 3.9 Implement batched review posting: all inline findings in ONE `POST /pulls/{n}/reviews` call with an overall body — exactly one review per run
+- [x] 3.10 Handle the clean-PR path: zero findings above threshold completes with a "no issues found" summary
 - [ ] 3.11 Verify: a deliberately buggy dummy PR gets ≥1 correct inline comment on the right line; a docs-only PR gets a clean summary; injected-garbage LLM output does not crash; total run <2 min
 
 ## 4. M2 — Quality & Idempotency

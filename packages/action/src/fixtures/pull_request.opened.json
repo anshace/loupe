@@ -1,0 +1,25 @@
+{
+  "action": "opened",
+  "number": 7,
+  "pull_request": {
+    "number": 7,
+    "state": "open",
+    "draft": false,
+    "title": "Add discount calculation",
+    "head": {
+      "ref": "feature/discount",
+      "sha": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
+    },
+    "base": {
+      "ref": "main"
+    },
+    "changed_files": 3,
+    "additions": 42,
+    "deletions": 7
+  },
+  "repository": {
+    "name": "code-review-testbed",
+    "full_name": "anshace/code-review-testbed",
+    "owner": { "login": "anshace" }
+  }
+}

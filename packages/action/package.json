@@ -1,0 +1,11 @@
+{
+  "name": "@code-review/action",
+  "private": true,
+  "version": "0.0.0",
+  "main": "dist/main.js",
+  "dependencies": {
+    "@actions/core": "^1.11.1",
+    "@actions/github": "^6.0.0",
+    "@code-review/engine": "*"
+  }
+}
