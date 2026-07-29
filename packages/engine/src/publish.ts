@@ -12,6 +12,27 @@ export function formatFindingComment(finding: Finding): string {
   return body;
 }
 
+/**
+ * Render file-level findings (anchoring fell back to "file") as per-file
+ * sections for the review body — part of the no-finding-lost chain (4.2).
+ */
+export function formatFileLevelSections(findings: Finding[]): string {
+  const byFile = new Map<string, Finding[]>();
+  for (const f of findings) {
+    const list = byFile.get(f.file) ?? [];
+    list.push(f);
+    byFile.set(f.file, list);
+  }
+  const sections: string[] = [];
+  for (const [file, list] of byFile) {
+    sections.push(
+      `**\`${file}\`** (file-level — could not be anchored to a diff line):\n` +
+        list.map((f) => `- **[${f.severity}]** ${f.title}: ${f.body}`).join("\n"),
+    );
+  }
+  return sections.join("\n\n");
+}
+
 /** Build the single POST /pulls/{n}/reviews payload for a run. Pure. */
 export function buildReviewPayload(summary: string, findings: Finding[]): ReviewPayload {
   const comments = findings

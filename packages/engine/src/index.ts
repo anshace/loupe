@@ -17,6 +17,12 @@ export * from "./prompt";
 export * from "./guardrail";
 export * from "./clamp";
 export * from "./publish";
+export * from "./gate";
+export * from "./config";
+export * from "./suppress";
+export * from "./dedupe";
+export * from "./summary";
+export * from "./cost";
 export * from "./run";
 
 export * from "./stats";

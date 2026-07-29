@@ -15,3 +15,9 @@ instructions (design decision 7). No prompt text lives inline in code.
   commentable line ranges) as documented placeholders.
 
 First real file arrives with M1: `reviewer-v1.md`.
+
+Versions:
+
+- `reviewer-v1.md` — M1 single-pass reviewer (rubric + line-range constraint).
+- `reviewer-v2.md` — M2: adds the do-not-report list and the `{{HOUSE_RULES}}`
+  block. **Current engine default.**

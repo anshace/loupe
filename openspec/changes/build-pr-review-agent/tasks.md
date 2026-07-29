@@ -31,17 +31,17 @@
 
 ## 4. M2 — Quality & Idempotency
 
-- [ ] 4.1 Add the explicit do-not-report list to the prompt (style nits, speculative concerns, unchanged-code issues below high severity) and a code-side suppression filter that drops such findings before publishing
-- [ ] 4.2 Implement the fallback anchoring chain: exact line → nearest commentable diff line (≤50 away) → file-level comment → inclusion in summary; assert in tests that no finding is ever silently dropped
-- [ ] 4.3 Implement stateless dedupe: read existing bot comments on the PR via API and skip candidate findings that duplicate an existing comment at the same location/substance
-- [ ] 4.4 Implement summary upsert: one summary comment per PR identified by a hidden HTML marker; edit in place when it exists, create only when absent; summary carries skipped-file count, truncation disclosure, and config notices
-- [ ] 4.5 Implement the run gate in the engine: skip draft PRs, skip events whose actor is the bot itself, skip when the head SHA matches the last completed review (recorded in the hidden summary marker) unless explicitly requested on demand
-- [ ] 4.6 Implement `.aireview.toml` loading from the reviewed revision of the target repo (via contents API at the PR head): enable/disable toggle, minimum severity threshold, ignored path globs
-- [ ] 4.7 Apply config semantics: disabled repo → no run and no comments; findings below threshold never published inline or in summary; ignored-glob files excluded from review with no findings ever reported against them
-- [ ] 4.8 Implement safe defaults: missing config → documented defaults (enabled, default threshold, standard noise ignores); malformed/invalid config → run proceeds on defaults and the summary shows a visible config-problem notice (never crash, never skip)
-- [ ] 4.9 Implement optional `HOUSE_RULES.md` support: file content supplied to the prompt, and findings contradicting an explicit house rule suppressed before publishing; absent file → no suppression
-- [ ] 4.10 Implement the Claude Haiku 4.5 provider with prompt caching on the stable system prompt; make it the quality default with Gemini Flash as the free-tier mode (provider selection via config/env, plus Groq Llama as free fallback)
-- [ ] 4.11 Implement per-run token/cost cap from real provider token counts and a monthly budget env var that degrades to the free-tier model when exceeded; on cap hit mid-run, stop model calls and publish what exists with an early-stop notice
+- [x] 4.1 Add the explicit do-not-report list to the prompt (style nits, speculative concerns, unchanged-code issues below high severity) and a code-side suppression filter that drops such findings before publishing
+- [x] 4.2 Implement the fallback anchoring chain: exact line → nearest commentable diff line (≤50 away) → file-level comment → inclusion in summary; assert in tests that no finding is ever silently dropped
+- [x] 4.3 Implement stateless dedupe: read existing bot comments on the PR via API and skip candidate findings that duplicate an existing comment at the same location/substance
+- [x] 4.4 Implement summary upsert: one summary comment per PR identified by a hidden HTML marker; edit in place when it exists, create only when absent; summary carries skipped-file count, truncation disclosure, and config notices
+- [x] 4.5 Implement the run gate in the engine: skip draft PRs, skip events whose actor is the bot itself, skip when the head SHA matches the last completed review (recorded in the hidden summary marker) unless explicitly requested on demand
+- [x] 4.6 Implement `.aireview.toml` loading from the reviewed revision of the target repo (via contents API at the PR head): enable/disable toggle, minimum severity threshold, ignored path globs
+- [x] 4.7 Apply config semantics: disabled repo → no run and no comments; findings below threshold never published inline or in summary; ignored-glob files excluded from review with no findings ever reported against them
+- [x] 4.8 Implement safe defaults: missing config → documented defaults (enabled, default threshold, standard noise ignores); malformed/invalid config → run proceeds on defaults and the summary shows a visible config-problem notice (never crash, never skip)
+- [x] 4.9 Implement optional `HOUSE_RULES.md` support: file content supplied to the prompt, and findings contradicting an explicit house rule suppressed before publishing; absent file → no suppression
+- [x] 4.10 Implement the Claude Haiku 4.5 provider with prompt caching on the stable system prompt; make it the quality default with Gemini Flash as the free-tier mode (provider selection via config/env, plus Groq Llama as free fallback)
+- [x] 4.11 Implement per-run token/cost cap from real provider token counts and a monthly budget env var that degrades to the free-tier model when exceeded; on cap hit mid-run, stop model calls and publish what exists with an early-stop notice
 - [ ] 4.12 Verify: pushing twice to the same PR produces zero duplicate comments; the summary is edited in place, not re-posted; a `HOUSE_RULES.md` rule suppresses its matching finding; style nitpicks no longer appear; a draft PR gets no comments
 - [ ] 4.13 Verify: repo with no config reviews on defaults; repo with broken TOML still reviews and the summary notes the invalid config; changing config in the repo takes effect on the next PR with no redeploy
 

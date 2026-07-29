@@ -81,3 +81,23 @@ describe("postReview", () => {
     await expect(postReview(pr, "tok", payload, fake)).rejects.toThrow(/HTTP 422 Unprocessable/);
   });
 });
+
+import { formatFileLevelSections } from "./publish";
+
+describe("formatFileLevelSections", () => {
+  it("groups file-level findings into per-file sections", () => {
+    const out = formatFileLevelSections([
+      fileLevel,
+      { ...fileLevel, title: "Second concern", body: "Also this." },
+      { ...fileLevel, file: "src/other.ts", title: "Elsewhere", body: "x" },
+    ]);
+    expect(out).toContain("**`src/big.ts`** (file-level");
+    expect(out).toContain("- **[medium]** General concern: This module is getting large.");
+    expect(out).toContain("- **[medium]** Second concern: Also this.");
+    expect(out).toContain("**`src/other.ts`**");
+  });
+
+  it("returns an empty string for no findings", () => {
+    expect(formatFileLevelSections([])).toBe("");
+  });
+});

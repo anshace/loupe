@@ -57,3 +57,55 @@ describe("clampFindings", () => {
     expect(out.map((f) => f.line)).toEqual([10, undefined, undefined]);
   });
 });
+
+import { anchorFinding, anchorFindings } from "./clamp";
+
+describe("anchorFinding — fallback chain (no finding lost)", () => {
+  const commentable = { "src/app.ts": [3, 4, 6, 7], "gone.txt": [] as number[] };
+  const base = { severity: "high" as const, category: "bug", file: "src/app.ts", title: "t", body: "b" };
+
+  it("exact commentable line → inline at that line", () => {
+    expect(anchorFinding({ ...base, line: 4 }, commentable)).toEqual({
+      finding: { ...base, line: 4 },
+      placement: "line",
+    });
+  });
+
+  it("near miss → nearest commentable line within 50", () => {
+    const anchored = anchorFinding({ ...base, line: 9 }, commentable);
+    expect(anchored.placement).toBe("nearest");
+    expect(anchored.finding.line).toBe(7);
+  });
+
+  it("too far → file-level", () => {
+    const anchored = anchorFinding({ ...base, line: 500 }, commentable);
+    expect(anchored.placement).toBe("file");
+    expect(anchored.finding.line).toBeUndefined();
+  });
+
+  it("file in the diff but with no commentable lines → file-level", () => {
+    const anchored = anchorFinding({ ...base, file: "gone.txt", line: 2 }, commentable);
+    expect(anchored.placement).toBe("file");
+  });
+
+  it("no line at all on a diffed file → file-level", () => {
+    expect(anchorFinding({ ...base }, commentable).placement).toBe("file");
+  });
+
+  it("file not in the diff view → summary mention, never dropped", () => {
+    const anchored = anchorFinding({ ...base, file: "not-in-diff.ts", line: 1 }, commentable);
+    expect(anchored.placement).toBe("summary");
+    expect(anchored.finding.file).toBe("not-in-diff.ts");
+  });
+
+  it("anchorFindings assigns a placement to every input", () => {
+    const findings = [
+      { ...base, line: 4 },
+      { ...base, line: 500 },
+      { ...base, file: "mystery.ts", line: 1 },
+    ];
+    const anchored = anchorFindings(findings, commentable);
+    expect(anchored).toHaveLength(findings.length);
+    expect(anchored.every((a) => ["line", "nearest", "file", "summary"].includes(a.placement))).toBe(true);
+  });
+});
