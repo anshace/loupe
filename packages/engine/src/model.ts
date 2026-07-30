@@ -337,9 +337,14 @@ export interface BuildProviderConfig {
 }
 
 /**
- * apiKey resolution: explicit → LLM_API_KEY → provider-specific vars, in order.
- * Returns undefined when nothing is set (the provider then reads its own env
- * var at call time, or throws a clear missing-key error).
+ * apiKey resolution: explicit → provider-specific vars → LLM_API_KEY, in order.
+ * Provider-specific wins over the generic LLM_API_KEY: if you set GEMINI_API_KEY
+ * and choose the gemini provider, that is unambiguous intent, and an unrelated
+ * ambient LLM_API_KEY (e.g. set for another tool) must not silently override it.
+ * LLM_API_KEY remains the fallback so the Action's unified `llm-api-key` input
+ * still works when no provider-specific var is set. Returns undefined when
+ * nothing is set (the provider then reads its own env var at call time, or
+ * throws a clear missing-key error).
  */
 function resolveApiKey(
   explicit: string | undefined,
@@ -347,10 +352,10 @@ function resolveApiKey(
   ...providerVars: string[]
 ): string | undefined {
   if (explicit) return explicit;
-  if (env.LLM_API_KEY) return env.LLM_API_KEY;
   for (const v of providerVars) {
     if (env[v]) return env[v];
   }
+  if (env.LLM_API_KEY) return env.LLM_API_KEY;
   return undefined;
 }
 

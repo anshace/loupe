@@ -124,6 +124,12 @@ You can also configure everything from **env/secrets** instead of `with:` inputs
     LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
 ```
 
+**API-key precedence:** the `llm-api-key` input (or explicit config) is used
+first; otherwise a provider-specific env var (`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`) — which wins over a generic
+`LLM_API_KEY`, so an unrelated ambient `LLM_API_KEY` never silently overrides an
+explicitly-set provider key — and `LLM_API_KEY` last as the unified fallback.
+
 ### Escalation
 
 For any provider, set `escalation-model` to route risky diffs

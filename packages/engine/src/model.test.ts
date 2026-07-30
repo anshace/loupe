@@ -374,8 +374,8 @@ describe("buildProvider", () => {
     expect(() => buildProvider({ provider: "openai", env: noKeyEnv })).toThrow(/requires an explicit model/);
   });
 
-  it("resolves apiKey via LLM_API_KEY then provider-specific vars", async () => {
-    // explicit apiKey wins
+  it("resolves apiKey via explicit → provider-specific → LLM_API_KEY", async () => {
+    // explicit apiKey wins over everything
     const explicit = buildProvider({
       provider: "openai",
       model: "x",
@@ -383,30 +383,30 @@ describe("buildProvider", () => {
       env: { LLM_API_KEY: "unified", OPENAI_API_KEY: "specific" },
       fetchImpl: async () => ({ ok: true, status: 200, text: async () => OPENAI_RESPONSE }),
     });
-    // LLM_API_KEY over the provider-specific var
+    // provider-specific var wins over a generic (possibly unrelated) LLM_API_KEY
     let seen = "";
     const capture: FetchLike = async (_url, init) => {
       seen = String(init?.headers?.authorization);
       return { ok: true, status: 200, text: async () => OPENAI_RESPONSE };
     };
-    const unified = buildProvider({
+    const specificWins = buildProvider({
       provider: "openai",
       model: "x",
       env: { LLM_API_KEY: "unified", OPENAI_API_KEY: "specific" },
       fetchImpl: capture,
     });
-    await unified.complete({ system: "s", user: "u" });
-    expect(seen).toBe("Bearer unified");
+    await specificWins.complete({ system: "s", user: "u" });
+    expect(seen).toBe("Bearer specific");
 
-    // provider-specific var when LLM_API_KEY is absent
-    const specific = buildProvider({
+    // LLM_API_KEY is the fallback when no provider-specific var is set
+    const unifiedFallback = buildProvider({
       provider: "openai",
       model: "x",
-      env: { OPENROUTER_API_KEY: "or-key" },
+      env: { LLM_API_KEY: "unified" },
       fetchImpl: capture,
     });
-    await specific.complete({ system: "s", user: "u" });
-    expect(seen).toBe("Bearer or-key");
+    await unifiedFallback.complete({ system: "s", user: "u" });
+    expect(seen).toBe("Bearer unified");
     expect(explicit).toBeInstanceOf(OpenAICompatibleProvider);
   });
 });
