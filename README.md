@@ -148,13 +148,17 @@ with:
 
 | Path | Purpose |
 |------|---------|
-| `openspec/` | Source of truth — spec-driven changes (proposal → specs → design → tasks) |
-| `research/` | Research: competitor repos, product landscape, GitHub integration mechanics, RAG strategies, stack & cost analysis, synthesis + milestones |
-| `docs/` | Personal notes (solo project — no separate team docs) |
-| `src/` | Implementation (created during `/opsx:apply`) |
+| `packages/` | Code: `engine` (zero-dep core), `action` (GitHub Action adapter), `worker` (Cloudflare App adapter), `scope-ts` (optional tree-sitter), `rag` (optional retriever) |
+| `prompts/` | Versioned reviewer/verifier prompt files (`reviewer-v7.md`, `verifier-v2.md`, …) |
+| `documentation/` | **Formal docs** — architecture, ADRs, planning (+ offline HTML renders in `documentation/html/`) |
+| `openspec/` | Spec-driven change record — proposal → specs → design → tasks |
+| `research/` | Research corpus: competitor landscape, GitHub mechanics, RAG strategies, stack & cost, synthesis + milestones (01–10) |
+| `guides/` | How-to guides: how it works, the open-source Action, the future App, running & testing |
+| `evals/` | Offline eval harness + seeded cases |
+| `docs/` | Personal notes + setup docs (App setup, state, house-rules) |
 
 ## Where to start
 
-1. `research/08-synthesis-architecture-and-milestones.md` — architecture + roadmap
-2. `openspec/changes/build-pr-review-agent/proposal.md` — what & why
-3. `openspec/changes/build-pr-review-agent/design.md` — how
+1. `documentation/README.md` — the documentation index (architecture, ADRs, planning)
+2. `documentation/architecture.md` — the full architecture (or `documentation/html/architecture.html` offline)
+3. `openspec/changes/build-pr-review-agent/design.md` — the original design decisions

@@ -17,9 +17,11 @@ back on the PR.
 - `research/` — competitor/product/stack research files (numbered 01-09). Read
   `08-synthesis-architecture-and-milestones.md` for the architecture decisions
   and milestone roadmap.
+- `documentation/` — formal project docs: architecture, ADRs (`adr/`), planning,
+  plus offline HTML renders in `documentation/html/`. Start at
+  `documentation/README.md`.
 - `docs/` — Ansh's personal notes/scratch (Hindi allowed). No structure required.
-  This is a solo project (Ansh + Claude only) — no team-facing `documentation/`
-  folder; openspec + research are the documentation.
+  Solo project (Ansh + Claude only); openspec + research + documentation are the docs.
 
 ## Hard rules
 
