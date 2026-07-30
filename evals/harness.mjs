@@ -131,3 +131,73 @@ export function diffSnapshots(committed, current) {
 export function snapshotClean(diff) {
   return diff.changed.length === 0 && diff.added.length === 0 && diff.removed.length === 0;
 }
+
+// ── Shadow-mode dual-run (rounding-out; builds on comparePaired #24) ──────────
+//
+// Shadow mode differs from the symmetric A/B comparison above in framing, which
+// is what the LLMOps "shadow mode" pattern is about (see
+// research/features/eval-measurement.md §C.5): there is a PRIMARY config — the
+// authoritative one whose findings would actually be posted — and a SHADOW config
+// that is scored ALONGSIDE it but whose output is never posted and never affects
+// the primary. The question shadow mode answers is not "is B significantly
+// different from A" (that's `mcnemar`) but "if I promoted the shadow to primary,
+// how would the posted outcome change, and is that safe?".
+
+/** Posts a case would emit = expected-found (true positives) + unexpected (potential FPs). Pure. */
+function postCount(row) {
+  return (row?.expectedFound ?? 0) + (row?.unexpected ?? 0);
+}
+
+/**
+ * Per-case shadow comparison (shadow − primary). ASYMMETRIC: `primaryRows` is the
+ * live/authoritative side, `shadowRows` the candidate scored beside it. For each
+ * case name (union of both, sorted) reports the found/missed/unexpected deltas, how
+ * many findings each side would post, and a `verdict` classifying how promoting the
+ * shadow would change that case:
+ *   agree           — identical caught + emitted counts
+ *   shadow-more     — shadow would post strictly more findings
+ *   shadow-fewer    — shadow would post strictly fewer findings
+ *   shadow-different— same number posted but a different composition (e.g. traded a
+ *                     real catch for a false positive)
+ * `differs` is true for anything but `agree`. Pure — no IO, no clock.
+ */
+export function shadowCompare(primaryRows, shadowRows) {
+  const byNameP = new Map(primaryRows.map((r) => [r.name, r]));
+  const byNameS = new Map(shadowRows.map((r) => [r.name, r]));
+  const names = [...new Set([...byNameP.keys(), ...byNameS.keys()])].sort();
+  const cases = [];
+  for (const name of names) {
+    const p = byNameP.get(name);
+    const s = byNameS.get(name);
+    const foundDelta = (s?.expectedFound ?? 0) - (p?.expectedFound ?? 0);
+    const missedDelta = (s?.expectedMissed ?? 0) - (p?.expectedMissed ?? 0);
+    const unexpectedDelta = (s?.unexpected ?? 0) - (p?.unexpected ?? 0);
+    const primaryPosts = postCount(p);
+    const shadowPosts = postCount(s);
+    let verdict;
+    if (foundDelta === 0 && unexpectedDelta === 0) verdict = "agree";
+    else if (shadowPosts > primaryPosts) verdict = "shadow-more";
+    else if (shadowPosts < primaryPosts) verdict = "shadow-fewer";
+    else verdict = "shadow-different";
+    cases.push({ name, foundDelta, missedDelta, unexpectedDelta, primaryPosts, shadowPosts, verdict, differs: verdict !== "agree" });
+  }
+  return cases;
+}
+
+/**
+ * Roll a `shadowCompare` result up into the promotion-decision numbers: how many
+ * cases would change if the shadow were promoted, and the net newly-caught /
+ * newly-missed / new-potential-FP / fewer-potential-FP deltas across the corpus.
+ * Pure.
+ */
+export function shadowSummary(cases) {
+  const out = { total: cases.length, changed: 0, newlyCaught: 0, newlyMissed: 0, newFPs: 0, fewerFPs: 0 };
+  for (const c of cases) {
+    if (c.differs) out.changed += 1;
+    if (c.foundDelta > 0) out.newlyCaught += c.foundDelta;
+    else if (c.foundDelta < 0) out.newlyMissed += -c.foundDelta;
+    if (c.unexpectedDelta > 0) out.newFPs += c.unexpectedDelta;
+    else if (c.unexpectedDelta < 0) out.fewerFPs += -c.unexpectedDelta;
+  }
+  return out;
+}

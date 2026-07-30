@@ -39,6 +39,10 @@ import type { LedgerIo } from "./cost";
 import { CostTracker, isOverMonthlyBudget, monthKey, recordSpend } from "./cost";
 import type { ExistingComments } from "./dedupe";
 import { dedupeFindings, fetchExistingComments, groupNearDuplicates } from "./dedupe";
+import type { FeedbackReport } from "./feedback";
+import { buildFeedbackReport, fetchReviewThreadResolution, toRunLogFeedback } from "./feedback";
+import { generateSuggestionsFile } from "./suggestions";
+import type { SuggestionsIo } from "./suggestions";
 import type { FetchLike } from "./diff";
 import { fetchPrDiff, parseUnifiedDiff } from "./diff";
 import { ESCALATION_MODEL, computeEscalation, riskyPaths } from "./escalate";
@@ -47,7 +51,15 @@ import { decideScope, dropReviewedHunks, fetchCompareDiff } from "./incremental"
 import type { Retriever } from "./retrieve";
 import { DEFAULT_RETRIEVAL_TOP_K, buildRetrievalQuery, renderRetrievedContext } from "./retrieve";
 import type { RunLogIo } from "./runlog";
-import { appendRunLog } from "./runlog";
+import { appendRunLog, readRunLog } from "./runlog";
+import { buildKeepRateTable, lowKeepRateShapes, preSuppressByCalibration, tallyShapes } from "./calibration";
+import {
+  REFLECTION_PROMPT_FILE,
+  applyReflection,
+  collectReflectionCandidates,
+  formatReflectionCandidates,
+  parseReflectionOutput,
+} from "./reflect";
 import type { PrState, StateStore } from "./state";
 import {
   MAX_OPEN_FINDINGS,
@@ -74,6 +86,10 @@ import {
   scanRepoImports,
 } from "./importgraph";
 import { scanSecrets } from "./secrets";
+import { DEFAULT_CTAGS_CAPS, buildSymbolIndex, renderChangedSymbolDefs } from "./ctags";
+import { buildRepoMap, renderRepoMap } from "./repomap";
+import type { SymbolService } from "./symbols";
+import { diagnosticsToFindings } from "./symbols";
 import { checkWorkflows } from "./workflowcheck";
 import { auditDependencies, scanDependencyChanges } from "./deps";
 import { renderSinkEvidence, scanSinks } from "./sinkpack";
@@ -118,6 +134,7 @@ import type {
   Finding,
   PrIdentity,
   PrIntent,
+  ReflectionRecord,
   ReviewPayload,
   ReviewResult,
   SkippedFile,
@@ -159,8 +176,19 @@ export interface RunDeps {
   headFiles?: Record<string, string | undefined>;
   /** Replace the enclosing-scope expander (e.g. tree-sitter from packages/scope-ts). */
   scopeExpander?: ScopeExpander;
+  /**
+   * TS language service (report item #33), e.g. `createSymbolService` from
+   * packages/ts-symbols. Injected because the engine stays zero-dep and cannot
+   * import `typescript`; the Action adapter builds it over a RepoReader and
+   * passes it here. Consumed when `config.tsSymbols` (agentic symbol tools) or
+   * `config.tsDiagnostics` (semantic-diagnostic findings) is on. Absent → those
+   * features are cleanly skipped. Tests inject a mock.
+   */
+  symbolService?: SymbolService;
   /** Bypass loading prompts/verifier-v1.md (tests / Workers path). */
   verifierTemplate?: string;
+  /** Bypass loading prompts/verifier-meta-v1.md for the reflection pass (feature #27; tests). */
+  reflectionTemplate?: string;
   /** Replace the agentic repo reader (tests). */
   repoReader?: RepoReader;
   /** Environment for provider selection + monthly budget (default process.env). */
@@ -177,6 +205,15 @@ export interface RunDeps {
   stateStore?: StateStore;
   /** Run-log file IO overrides (tests). */
   runLogIo?: RunLogIo;
+  /**
+   * Review-thread resolution map (feature #12): comment databaseId → isResolved.
+   * When provided (even empty), NO GraphQL call is made — tests inject it;
+   * production fetches it via `fetchReviewThreadResolution` when
+   * `config.feedbackCapture` is on.
+   */
+  reviewThreadResolution?: Map<number, boolean>;
+  /** Learned-rule suggestion-file IO overrides (feature #31; tests). */
+  suggestionsIo?: SuggestionsIo;
   /** CI/lint/tsc output file IO overrides (feature #16 ingestion; tests). */
   ciIo?: CiIo;
   /** Retrieval implementation for the RAG experiment (task 7.6, packages/rag). */
@@ -202,6 +239,33 @@ const WALKTHROUGH_INSTRUCTION_ON =
   'overview of what this change does and where the risk is>", "findings": [ ...the findings array... ]}. ' +
   "The walkthrough is prose (not a finding) and never a substitute for a finding.";
 const WALKTHROUGH_INSTRUCTION_OFF = "(not requested — respond with the bare findings array as specified above)";
+
+/**
+ * TS language-service tool documentation (report item #33), appended to the
+ * {{TOOLS}} block ONLY when a SymbolService is active this run. The reviewer-v9
+ * system prompt documents grep/read_file/find_importers statically; the symbol
+ * tools are advertised dynamically here (via the substituted {{TOOLS}} value) so
+ * no shipped prompt file has to change to gate them behind the flag.
+ */
+const SYMBOL_TOOLS_ADDENDUM =
+  "\n\nTS language-service tools are ALSO available (real semantic queries over " +
+  "the PR-head TypeScript/JavaScript, not text search). Give a file `path` and a " +
+  "`symbol` name (and optionally the 1-based `line` to disambiguate which " +
+  "occurrence):\n" +
+  "```json\n" +
+  "{\n" +
+  '  "tool_calls": [\n' +
+  '    { "tool": "find_definition", "path": "src/foo.ts", "symbol": "doThing" },\n' +
+  '    { "tool": "find_references", "path": "src/foo.ts", "symbol": "doThing" },\n' +
+  '    { "tool": "hover", "path": "src/foo.ts", "symbol": "doThing", "line": 42 }\n' +
+  "  ]\n" +
+  "}\n" +
+  "```\n" +
+  "- `find_definition` resolves a use to its true declaration (through renames/" +
+  "re-exports a grep would miss); `find_references` lists real call sites across " +
+  "files; `hover` returns the resolved type/signature.\n" +
+  "- Prefer these over grep when checking whether a changed signature's callers " +
+  "were updated, or what a symbol's real type is.";
 
 export interface SummaryParts {
   findings: Finding[];
@@ -364,6 +428,23 @@ export async function runReview(
   }
   const minSeverity = config.minSeverity ?? repoConfig.minSeverity;
 
+  // ── Feedback-observability capture (feature #12): read developer feedback on
+  // Loupe's OWN prior comments — reaction tallies (already parsed from the REST
+  // dedupe fetch) + each comment's review-thread resolution (one GraphQL call) —
+  // and classify accepted/disputed/unresolved. PURE OBSERVABILITY: it never
+  // changes what is posted; every step fails soft. Default OFF (extra call) and
+  // only meaningful when botIdentity scopes the fetch to Loupe's own comments.
+  let feedbackReport: FeedbackReport | undefined;
+  if ((config.feedbackCapture ?? false) && config.botIdentity && existing.reviewComments.length > 0) {
+    try {
+      const resolution =
+        deps.reviewThreadResolution ?? (await fetchReviewThreadResolution(pr, auth, fetchImpl));
+      feedbackReport = buildFeedbackReport(existing.reviewComments, resolution);
+    } catch {
+      // Feedback capture is best-effort observability — never affects the run.
+    }
+  }
+
   // ── Incremental scope (7.2): before..after compare when a prior review is
   // known and the event carries a before SHA; otherwise the full PR diff.
   const scope = decideScope({
@@ -520,6 +601,12 @@ export async function runReview(
   let verification: ReviewResult["verification"];
   let agenticUsage: ReviewResult["agenticUsage"];
   let walkthrough: string | undefined;
+  // Empirical-calibration pre-suppressions (feature #29): removed before the
+  // verifier, merged into the suppressed record after applySuppressions.
+  let calibrationSuppressed: SuppressedFinding[] = [];
+  // Per-(category,severity) shape tallies of what the verifier kept vs dropped
+  // this run (feature #29 run-log capture); undefined when the verifier did not run.
+  let verifierShapes: { kept: Record<string, number>; dropped: Record<string, number> } | undefined;
   const nothingReviewable = kept.length === 0;
 
   if (!nothingReviewable) {
@@ -593,6 +680,55 @@ export async function runReview(
         relatedTestsText = renderRelatedTests(await discoverRelatedTests(testInputs, reader));
       } catch {
         notices.push("related-tests discovery failed — continuing without it");
+      }
+    }
+
+    // ── Ranked repo-map priming + ctags-lite symbol index (rounding-out items):
+    // two cheap, read-only context sources built from the RepoReader — a ranked
+    // repository-structure sketch ({{REPO_MAP}}) and a lightweight symbol-def
+    // index for the touched symbols ({{SYMBOL_INDEX}}). Both default OFF (a repo
+    // scan), fail-soft, and "(none)"-safe. They are ambient background — NOT part
+    // of the grounding source (a dir list / definition location is not quotable
+    // evidence a finding should cite). One shared reader avoids a double tree fetch.
+    let repoMapText = "(none)";
+    let symbolIndexText = "(none)";
+    const repoMapOn = config.repoMap ?? false;
+    const ctagsOn = config.ctagsIndex ?? false;
+    if (repoMapOn || ctagsOn) {
+      const ctxReader = deps.repoReader ?? githubRepoReader(pr, auth, config.event?.headSha, fetchImpl);
+      if (repoMapOn) {
+        try {
+          const tree = await ctxReader.listTree();
+          const changedFiles = scopeInputs.map((s) => ({ path: s.path, content: s.content }));
+          repoMapText = renderRepoMap(buildRepoMap({ tree, changedFiles }), {
+            maxChars: config.repoMapMaxChars,
+          });
+        } catch {
+          notices.push("repo-map priming failed — continuing without it");
+        }
+      }
+      if (ctagsOn) {
+        try {
+          const index = await buildSymbolIndex(
+            ctxReader,
+            { ...DEFAULT_CTAGS_CAPS, ...config.ctagsCaps },
+            newAgenticUsage(),
+          );
+          const changedNames = [
+            ...new Set(
+              kept
+                .filter((f) => !f.isBinary && f.status !== "deleted")
+                .flatMap((f) =>
+                  extractChangedSymbols(
+                    f.hunks.flatMap((h) => h.lines.filter((l) => l.type === "add").map((l) => l.content)),
+                  ),
+                ),
+            ),
+          ];
+          symbolIndexText = renderChangedSymbolDefs(index, changedNames);
+        } catch {
+          notices.push("symbol index (ctags-lite) failed — continuing without it");
+        }
       }
     }
 
@@ -696,16 +832,22 @@ export async function runReview(
     const securityChecklist = buildSecurityChecklist(kept);
 
     // ── Agentic tool loop setup (6.3): OFF by default; one shared budget per run.
+    // TS symbol tools (report item #33) are added when the `tsSymbols` flag is on
+    // AND a language service was injected (packages/ts-symbols) — they are
+    // executed by this same loop, so they require `agentic` on too.
     const agenticOn = config.agentic ?? false;
+    const symbolsOn = (config.tsSymbols ?? false) && deps.symbolService !== undefined && agenticOn;
     const agenticOpts: AgenticOptions | undefined = agenticOn
       ? {
           reader: deps.repoReader ?? githubRepoReader(pr, auth, config.event?.headSha, fetchImpl),
           caps: config.agenticCaps,
           usage: newAgenticUsage(),
+          symbols: symbolsOn ? deps.symbolService : undefined,
         }
       : undefined;
     const toolsText = agenticOn
-      ? "enabled — you may request tools as described in the system prompt."
+      ? "enabled — you may request tools as described in the system prompt." +
+        (symbolsOn ? SYMBOL_TOOLS_ADDENDUM : "")
       : "disabled — respond with the required JSON array only.";
     const diffText2 = kept.map((f) => f.rawText).join("\n");
     const contextText = context.text || "(none)";
@@ -766,6 +908,9 @@ export async function runReview(
         fewShotExemplars: fewShotOn,
         walkthrough: walkthroughOn,
         sinkPack: sinkOn,
+        groundingFirst: config.groundingFirst ?? false,
+        repoMap: repoMapOn,
+        ctagsIndex: ctagsOn,
       });
       const template =
         deps.promptTemplate ?? loadPromptTemplate(config.promptPath, reviewerFile);
@@ -782,6 +927,8 @@ export async function runReview(
         SECURITY_CHECKLIST: securityChecklist,
         CROSS_FILE_CALLERS: crossFileText,
         SINK_EVIDENCE: sinkText,
+        REPO_MAP: repoMapText,
+        SYMBOL_INDEX: symbolIndexText,
         FEWSHOT_EXEMPLARS: buildFewShotExemplars(fewShotOn),
         WALKTHROUGH_INSTRUCTION: walkthroughOn ? WALKTHROUGH_INSTRUCTION_ON : WALKTHROUGH_INSTRUCTION_OFF,
         TOOLS: toolsText,
@@ -841,6 +988,38 @@ export async function runReview(
         }
       }
 
+      // ── Empirical calibration pre-suppression (report item #29): mine the
+      // run-log history into a per-(category,severity) verifier keep-rate table
+      // and pre-suppress finding shapes with a PERSISTENTLY LOW keep-rate BEFORE
+      // the verifier sees them — a cheap, zero-inference prior learned from
+      // Loupe's own behavior. Removed findings are recorded (reason
+      // `low-keep-rate`), NEVER silently dropped. Default OFF; a cold/short
+      // history (too few samples per shape) suppresses nothing. Fail-soft.
+      if ((config.empiricalCalibration ?? false) && !degraded && rawFindings.length > 0) {
+        const historyPath = config.calibrationHistoryPath ?? config.runLogPath;
+        if (historyPath) {
+          try {
+            const table = buildKeepRateTable(readRunLog(historyPath, deps.runLogIo));
+            const low = lowKeepRateShapes(table, {
+              threshold: config.calibrationKeepRateThreshold,
+              minSamples: config.calibrationMinSamples,
+            });
+            if (low.size > 0) {
+              const split = preSuppressByCalibration(rawFindings, low);
+              if (split.suppressed.length > 0) {
+                rawFindings = split.kept;
+                calibrationSuppressed = split.suppressed;
+                notices.push(
+                  `empirical calibration: pre-suppressed ${split.suppressed.length} finding(s) whose shape has a persistently low historical keep-rate`,
+                );
+              }
+            }
+          } catch {
+            // Calibration is a best-effort prior — a bad/absent history never fails the run.
+          }
+        }
+      }
+
       // ── Verifier pass (6.4): keep/rewrite/drop with evidence; fail OPEN.
       // Default OFF until the eval set (6.8) proves it.
       if ((config.verify ?? false) && !degraded && rawFindings.length > 0) {
@@ -877,23 +1056,85 @@ export async function runReview(
             notices.push("verification skipped: cost cap");
             earlyStop = true;
           } else if (verifierLoop.response) {
-            const outcome = applyVerdicts(
-              rawFindings,
-              parseVerifierOutput(verifierLoop.response.text),
-              groundingSource,
-            );
+            // Findings passed to the verifier this pass — kept BEFORE reassignment
+            // so the reflection pass can map its critical/high `keep` candidates
+            // back by reference.
+            const preVerifyFindings = rawFindings;
+            const decisions = parseVerifierOutput(verifierLoop.response.text);
+            const outcome = applyVerdicts(preVerifyFindings, decisions, groundingSource);
             if (outcome.degraded) {
               notices.push(
                 "verification degraded: verifier output could not be parsed — publishing unverified findings",
               );
             }
-            rawFindings = outcome.kept;
+            // Run-log shape capture (feature #29): what the verifier kept vs dropped.
+            verifierShapes = {
+              kept: tallyShapes(outcome.kept),
+              dropped: tallyShapes(outcome.dropped.map((d) => d.finding)),
+            };
+
+            // ── Bounded reflection — "verifier-of-verifier" (report item #27):
+            // one extra critique pass over ONLY the critical/high `keep`s, asking
+            // whether the verifier's cited evidence actually establishes the
+            // claim. A failure DEMOTES the finding one severity (never drops it)
+            // and is disclosed. Bounded to the per-run cost cap; only when
+            // `verify` produced parseable verdicts and the flag is on.
+            let keptFindings = outcome.kept;
+            let reflection: ReflectionRecord | undefined;
+            if ((config.reflection ?? false) && !outcome.degraded) {
+              const candidates = collectReflectionCandidates(preVerifyFindings, decisions);
+              if (candidates.length > 0) {
+                if (!tracker.canProceed()) {
+                  reflection = { reviewed: candidates.length, demotions: [], skippedForCost: true };
+                  notices.push("reflection skipped: cost cap");
+                  earlyStop = true;
+                } else {
+                  const metaTemplate =
+                    deps.reflectionTemplate ?? loadPromptTemplate(undefined, REFLECTION_PROMPT_FILE);
+                  const metaRendered = renderPrompt(metaTemplate, {
+                    CANDIDATES: formatReflectionCandidates(candidates),
+                    DIFF: diffForModel,
+                    CONTEXT: verifierContext,
+                    TOOLS: toolsText,
+                  });
+                  const metaLoop = await agenticComplete(model, metaRendered, tracker, agenticOpts);
+                  if (metaLoop.response) {
+                    const applied = applyReflection(
+                      outcome.kept,
+                      candidates,
+                      parseReflectionOutput(metaLoop.response.text),
+                    );
+                    keptFindings = applied.findings;
+                    reflection = applied.record;
+                    if (applied.record.demotions.length > 0) {
+                      notices.push(
+                        `reflection: demoted ${applied.record.demotions.length} critical/high finding(s) whose evidence did not establish the claim`,
+                      );
+                    }
+                  } else {
+                    reflection = {
+                      reviewed: candidates.length,
+                      demotions: [],
+                      skippedForCost: metaLoop.costStopped,
+                    };
+                    if (metaLoop.costStopped) {
+                      notices.push("reflection skipped: cost cap");
+                      earlyStop = true;
+                    }
+                  }
+                }
+              }
+            }
+
+            rawFindings = keptFindings;
             verification = {
               degraded: outcome.degraded,
-              keptCount: outcome.kept.length,
+              keptCount: keptFindings.length,
               rewrittenCount: outcome.rewrittenCount,
               dropped: outcome.dropped,
               ungrounded: outcome.ungrounded,
+              confidences: outcome.keptConfidences,
+              reflection,
             };
           }
         }
@@ -926,6 +1167,35 @@ export async function runReview(
     ...checkWorkflows(kept),
     ...depScan.findings,
   ];
+  // ── TS semantic diagnostics as findings (report item #33): a `tsc --noEmit`-
+  // style pass over the PR-head files via the injected language service. Only
+  // compiler-verified errors that land on an ADDED line survive (see
+  // diagnosticsToFindings), so these are zero-hallucination and scoped to the
+  // change. Requires the `typescript`-backed service (Action path); absent →
+  // skipped. Fail-soft — a service error never breaks the run.
+  if ((config.tsDiagnostics ?? false) && deps.symbolService && kept.length > 0) {
+    const codePaths = kept
+      .filter((f) => !f.isBinary && f.status !== "deleted" && /\.(tsx?|jsx?|mts|cts|mjs|cjs)$/i.test(f.path))
+      .map((f) => f.path);
+    if (codePaths.length > 0) {
+      try {
+        const diags = await deps.symbolService.getDiagnostics(codePaths);
+        const addedLinesForDiag: Record<string, readonly number[]> = Object.fromEntries(
+          kept.map((f) => [
+            f.path,
+            f.hunks.flatMap((h) => h.lines.filter((l) => l.type === "add").map((l) => l.newLine as number)),
+          ]),
+        );
+        const diagFindings = diagnosticsToFindings(diags, { addedLines: addedLinesForDiag });
+        if (diagFindings.length > 0) {
+          deterministic.push(...diagFindings);
+          notices.push(`TS compiler: ${diagFindings.length} type diagnostic(s) on changed lines surfaced as findings`);
+        }
+      } catch {
+        notices.push("TS diagnostics pass failed — continuing without it");
+      }
+    }
+  }
   // Optional network audit (feature #22): OSV.dev CVEs + npm license on the new
   // deps. Off by default; only runs when there are new deps to audit. Fail-soft.
   if ((config.dependencyAudit ?? false) && depScan.newDeps.length > 0) {
@@ -964,6 +1234,9 @@ export async function runReview(
     addedLines,
   });
   suppressed.push(...ignoredFindings);
+  // Empirical-calibration pre-suppressions (feature #29) were removed before the
+  // verifier; disclose them here so nothing is silently dropped.
+  suppressed.push(...calibrationSuppressed);
 
   // ── Anchoring chain (4.2): line → nearest → file-level → summary mention.
   const commentable: CommentableMap = Object.fromEntries(kept.map((f) => [f.path, f.commentableLines]));
@@ -1104,10 +1377,36 @@ export async function runReview(
         verifierDropped: verification?.dropped.length ?? 0,
         abstained: (verification?.dropped ?? []).filter((d) => d.reason === "insufficient-context").length,
         verifierUngrounded: verification?.ungrounded.length ?? 0,
+        // Self-reported verifier confidences (feature #30) + per-shape keep/drop
+        // tallies (feature #29) + reflection/calibration counts (features #27/#29).
+        verifierConfidences:
+          verification?.confidences && verification.confidences.length > 0
+            ? verification.confidences
+            : undefined,
+        verifierShapes,
+        reflectionDemoted: verification?.reflection?.demotions.length || undefined,
+        calibrationSuppressed: calibrationSuppressed.length || undefined,
         escalated,
         incremental: incremental !== undefined,
+        feedback: feedbackReport ? toRunLogFeedback(feedbackReport) : undefined,
       },
       deps.runLogIo,
+    );
+  }
+
+  // ── Learned-rule suggestion queue (feature #31): mine the run-log feedback
+  // (feature #12) across runs into SUGGESTED .aireview.toml ignore globs /
+  // HOUSE_RULES suppress lines, written to a LOCAL file. NEVER auto-applied —
+  // a human hand-copies what they agree with. Runs after the run-log append so
+  // it includes this run's feedback; needs the run log as its source. Best-
+  // effort: generateSuggestionsFile never throws.
+  if (config.suggestionsPath && config.runLogPath) {
+    generateSuggestionsFile(
+      config.runLogPath,
+      config.suggestionsPath,
+      { minSupport: config.suggestionMinSupport },
+      deps.suggestionsIo,
+      now,
     );
   }
 
@@ -1131,5 +1430,6 @@ export async function runReview(
     verification,
     agenticUsage,
     walkthrough,
+    feedback: feedbackReport,
   };
 }

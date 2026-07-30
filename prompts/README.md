@@ -60,7 +60,7 @@ Versions:
   + `{{WALKTHROUGH_INSTRUCTION}}` blocks PLUS v9's `{{RELATED_TESTS}}` +
   `{{CODE_HISTORY}}`. Renders identically to v9 when both flag placeholders are
   inert. Superseded as the flagged variant by v11.
-- `reviewer-v11.md` — the current flagged variant: adds `{{SINK_EVIDENCE}}` +
+- `reviewer-v11.md` — adds `{{SINK_EVIDENCE}}` +
   the taint-reasoning instruction (report item #21, dangerous-sink pack) on top
   of v10's few-shot/walkthrough blocks and v9's related-tests/history blocks.
   Pre-flagged dangerous sinks are injected as EVIDENCE the model must reason
@@ -68,7 +68,20 @@ Versions:
   on their own. Renders identically to v9 when every flag placeholder is inert;
   the engine selects v11 only when `fewShotExemplars`, `walkthrough`, or
   `sinkPack` is on (`selectReviewerPrompt`). v10 was left untouched per the
-  never-edit-shipped rule.
+  never-edit-shipped rule. Superseded as the flagged variant by v13.
+- `reviewer-v13.md` — **the current flagged variant**: adds two cheap read-only
+  context blocks on top of v11 — `{{REPO_MAP}}` (rounding-out item: a ranked
+  repository-structure sketch, top directories + key exported symbols from the
+  changed files, `repoMap` flag) and `{{SYMBOL_INDEX}}` (rounding-out item,
+  ctags-lite: where the symbols the PR touches are declared across the repo,
+  `ctagsIndex` flag). Both blocks are "(none)"-safe, so v13 renders identically
+  to v9 when every flag placeholder is inert. The engine (`selectReviewerPrompt`)
+  selects v13 when any of `fewShotExemplars` / `walkthrough` / `sinkPack` /
+  `repoMap` / `ctagsIndex` is on; `groundingFirst` (reviewer-v12) still takes
+  precedence and — like the other flagged blocks — is mutually exclusive with
+  the repo-map / symbol-index blocks. Both flags DEFAULT OFF (a whole-repo scan
+  costs read calls); pending live-eval measurement. v11 was left untouched per
+  the never-edit-shipped rule.
 - `verifier-v1.md` — M4: adversarial verifier — keep/rewrite/drop per finding
   with cited `file:line` evidence and the closed drop-reason enum.
 - `verifier-v2.md` — requires grounded `file:line` + verbatim-quote evidence on
@@ -82,3 +95,20 @@ Versions:
   required and still mechanically checked). Selected only when the
   `chainOfVerification` flag is on (which itself needs `verify` on). DEFAULT OFF
   — an uncertain precision lever pending live-eval measurement.
+- `reviewer-v12.md` — JSON field-ordering experiment (report item #28): identical
+  to the reviewer-v9 default in every instruction and placeholder, but the finding
+  schema is reordered so the grounding fields (`quote` + `why`) come BEFORE
+  `severity`/`title` — a lightweight forcing function to ground before committing
+  to a severity. The extra fields are ignored by the JSON guardrail, so it is
+  safe to A/B against v9. Selected only when the `groundingFirst` flag is on
+  (which takes precedence over the flagged reviewer variant). DEFAULT OFF —
+  flagged UNCERTAIN by the research (explicit CoT sometimes underperforms a bare
+  prompt for this task class), so validate on the eval harness before defaulting.
+- `verifier-meta-v1.md` — bounded reflection / "verifier-of-verifier" (report
+  item #27): a second, differently-framed critique pass run AFTER the normal
+  verifier, over ONLY the findings it kept at critical/high severity, asking
+  whether the verifier's OWN cited evidence actually establishes the claim. A
+  non-upheld finding is DEMOTED one severity by the engine — never dropped. New
+  role prefix (`verifier-meta`). Selected only when the `reflection` flag is on
+  (which itself needs `verify` on), and bounded to the per-run cost cap. DEFAULT
+  OFF — an uncertain precision lever pending live-eval measurement.

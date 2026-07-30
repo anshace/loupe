@@ -24,6 +24,28 @@ export type WebhookDispatch =
       commentId: number;
       /** Text after the command word (the /ask question). */
       argument: string;
+    }
+  | {
+      /**
+       * A reply UNDER an existing inline review-comment thread (report item #32).
+       * The handler verifies the thread is one of Loupe's OWN findings and gates
+       * on the replier being a collaborator before answering in-thread.
+       */
+      kind: "reply";
+      pr: PrIdentity;
+      installationId: number;
+      /** Login of the replier — permission-checked before anything runs. */
+      commenter: string;
+      /** The reply comment's own id (for the 👀 reaction ack). */
+      commentId: number;
+      /** The thread-root comment id being replied to (Loupe's finding). */
+      inReplyToId: number;
+      /** The reply text (attacker-reachable → injection-guarded downstream). */
+      body: string;
+      /** The diff hunk the thread is anchored to (comment.diff_hunk). */
+      diffHunk: string;
+      /** File path the thread is on. */
+      path?: string;
     };
 
 /** PR lifecycle actions that trigger an automatic review (spec: pr-trigger). */
@@ -124,6 +146,44 @@ function mapIssueComment(payload: Obj): WebhookDispatch {
   };
 }
 
+function mapReviewComment(payload: Obj): WebhookDispatch {
+  if (str(payload.action) !== "created") {
+    return { kind: "ignore", reason: "only newly created review comments are considered" };
+  }
+  const comment = obj(payload.comment);
+  // Only REPLIES (a comment with in_reply_to_id) sit "under" an existing finding.
+  // A fresh top-level review comment is not a reply to Loupe and is left alone.
+  const inReplyToId = num(comment?.in_reply_to_id);
+  if (inReplyToId === undefined) {
+    return { kind: "ignore", reason: "review comment is not a reply to an existing thread" };
+  }
+  const common = commonParts(payload);
+  if ("reason" in common) return { kind: "ignore", reason: common.reason };
+
+  const prNumber = num(obj(payload.pull_request)?.number);
+  const commentId = num(comment?.id);
+  const commenter = str(obj(comment?.user)?.login);
+  const body = str(comment?.body);
+  if (prNumber === undefined || commentId === undefined || commenter === undefined || body === undefined) {
+    return {
+      kind: "ignore",
+      reason: "review comment payload is missing pr number, comment id, commenter, or body",
+    };
+  }
+
+  return {
+    kind: "reply",
+    pr: { ...common.pr, prNumber },
+    installationId: common.installationId,
+    commenter,
+    commentId,
+    inReplyToId,
+    body,
+    diffHunk: str(comment?.diff_hunk) ?? "",
+    path: str(comment?.path),
+  };
+}
+
 /** Map an X-GitHub-Event name + parsed payload to a dispatch decision. */
 export function mapWebhook(eventName: string | undefined, payload: unknown): WebhookDispatch {
   const body = obj(payload);
@@ -133,6 +193,8 @@ export function mapWebhook(eventName: string | undefined, payload: unknown): Web
       return mapPullRequest(body);
     case "issue_comment":
       return mapIssueComment(body);
+    case "pull_request_review_comment":
+      return mapReviewComment(body);
     default:
       return { kind: "ignore", reason: `event "${eventName ?? "(none)"}" is not handled` };
   }

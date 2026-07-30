@@ -146,6 +146,38 @@ export interface VerificationRecord {
   dropped: DroppedFinding[];
   /** Verdicts whose evidence could not be grounded (feature #1) — kept, but flagged. */
   ungrounded: UngroundedVerdict[];
+  /**
+   * Self-reported verifier confidences (report item #30) for KEPT findings that
+   * supplied one, in kept order. Captured for offline calibration scoring
+   * (Brier/ECE) against real accept/reject outcomes; never acted on at run time.
+   */
+  confidences: number[];
+  /**
+   * Bounded reflection outcome (report item #27): critical/high `keep` verdicts
+   * whose cited evidence a second, differently-framed critique pass judged does
+   * NOT establish the claim. Such findings are DEMOTED one severity (never
+   * dropped) and disclosed here. Present only when the `reflection` flag ran.
+   */
+  reflection?: ReflectionRecord;
+}
+
+/** One finding demoted by the bounded reflection pass (report item #27). */
+export interface ReflectionDemotion {
+  finding: Finding;
+  from: Severity;
+  to: Severity;
+  /** The meta-reviewer's short reason the evidence did not establish the claim. */
+  note?: string;
+}
+
+/** Outcome of the bounded reflection pass (report item #27). */
+export interface ReflectionRecord {
+  /** Critical/high `keep` findings the reflection pass reviewed. */
+  reviewed: number;
+  /** Findings demoted one severity because the evidence did not establish the claim. */
+  demotions: ReflectionDemotion[];
+  /** True when the reflection pass was skipped for cost (cap reached). */
+  skippedForCost: boolean;
 }
 
 /** Engine configuration. Grows with milestones (.aireview.toml keys land at M2). */
@@ -195,6 +227,28 @@ export interface EngineConfig {
   /** Overrides for the agentic hard caps; see DEFAULT_AGENTIC_CAPS. */
   agenticCaps?: AgenticCaps;
   /**
+   * TS language-service symbol tools (report item #33): expose real
+   * find_definition / find_references / hover queries — backed by an in-memory
+   * `ts.LanguageService` over the PR-head files — as agentic tools the reviewer
+   * can call. Requires the `typescript`-backed service injected via
+   * `deps.symbolService` (packages/ts-symbols) AND `agentic` on (the tools are
+   * executed by the agentic loop). Default OFF, opt-in — the engine stays
+   * zero-dep; the service is only present on the Action path where `typescript`
+   * and a filesystem are available. Absent service → the tools are simply not
+   * offered (clean no-op).
+   */
+  tsSymbols?: boolean;
+  /**
+   * TS semantic diagnostics as findings (report item #33): a `tsc --noEmit`-
+   * style pass over the PR-head files whose compiler-verified errors — filtered
+   * to the PR's ADDED lines and stripped of no-node_modules artifacts — become
+   * deterministic, zero-hallucination findings (category `type-error`). Requires
+   * `deps.symbolService`; independent of `agentic`. Default OFF — it needs the
+   * injected `typescript` service and, like the tools, is only meaningful on the
+   * Action path; pending live-eval measurement of its precision on real PRs.
+   */
+  tsDiagnostics?: boolean;
+  /**
    * Run the verifier pass (task 6.4). Default OFF — stays off until the eval
    * set proves it kills ≥30% of raw findings correctly (task 6.8).
    */
@@ -238,6 +292,47 @@ export interface EngineConfig {
    */
   chainOfVerification?: boolean;
   /**
+   * Bounded reflection — "verifier-of-verifier" (report item #27): after the
+   * verifier pass, one extra critique pass over ONLY critical/high `keep`
+   * verdicts, asking whether the cited evidence actually establishes the claim.
+   * A failing finding is DEMOTED one severity (never silently dropped) and
+   * disclosed. Uses the verifier-meta prompt. Bounded to the per-run cost cap
+   * (skipped with a notice if exceeded). Only takes effect when `verify` is also
+   * on. Default OFF — an uncertain precision lever pending live-eval measurement
+   * (task 6.8-style).
+   */
+  reflection?: boolean;
+  /**
+   * JSON field-ordering experiment (report item #28): a reviewer prompt variant
+   * (reviewer-v12) that forces the grounding fields (`quote` + `why`) BEFORE the
+   * verdict/severity fields, as a lightweight forcing function to ground before
+   * committing to a severity. Default OFF — the research flags this as an
+   * UNCERTAIN win (explicit-CoT sometimes underperforms a bare prompt for this
+   * task class), so it is validate-first: measure on the eval harness before
+   * defaulting on. Mutually exclusive with the flagged reviewer variant
+   * (few-shot/walkthrough/sink) — it is a clean-schema experiment.
+   */
+  groundingFirst?: boolean;
+  /**
+   * Empirical calibration from run-log history (report item #29): mine the
+   * run-log JSONL into a per-(category, severity) verifier keep-rate table and
+   * pre-suppress finding shapes with a persistently low keep-rate BEFORE the
+   * verifier. Pre-suppressed findings are recorded (reason `low-keep-rate`),
+   * never silently dropped. Default OFF — an uncertain precision lever that also
+   * needs enough dogfooded history to be meaningful; pending live-eval
+   * measurement (task 6.8-style).
+   */
+  empiricalCalibration?: boolean;
+  /**
+   * Path to the run-log JSONL mined for the empirical calibration table (report
+   * item #29). Absent → falls back to `runLogPath`. Read-only; fail-soft.
+   */
+  calibrationHistoryPath?: string;
+  /** Keep-rate at/under which a shape is pre-suppressed (report item #29). Default 0.2. */
+  calibrationKeepRateThreshold?: number;
+  /** Minimum historical samples of a shape before its keep-rate is trusted (report item #29). Default 5. */
+  calibrationMinSamples?: number;
+  /**
    * Few-shot exemplars (report item #14): inject 2–4 curated true/false-positive
    * examples into the reviewer prompt (reviewer-v8). Default OFF — unproven and
    * costs tokens; pending live-eval measurement (task 6.8-style).
@@ -275,6 +370,31 @@ export interface EngineConfig {
    * set measures the precision win. Fail-soft; determinism via `deps.now`.
    */
   historyContext?: boolean;
+  /**
+   * Ranked repo-map priming (rounding-out item; research context-retrieval.md
+   * §10): inject a concise {{REPO_MAP}} reviewer block — top directories by file
+   * count + the key exported symbols declared in the changed files — as ambient
+   * structural orientation. Selects the flagged reviewer variant (v13). Default
+   * OFF — it lists the repo tree (one cached call) and is an uncertain-value
+   * ambient-priming lever (the model can already grep/read on demand), pending
+   * live-eval measurement. Fail-soft; "(none)"-safe. Capped by `repoMapMaxChars`.
+   */
+  repoMap?: boolean;
+  /** Char cap on the rendered {{REPO_MAP}} block; see DEFAULT_REPO_MAP_MAX_CHARS. */
+  repoMapMaxChars?: number;
+  /**
+   * ctags-lite symbol index (rounding-out item; research context-retrieval.md
+   * §7): a lightweight regex/heuristic definition index (TS/JS/Python) built once
+   * from the RepoReader, injected as the {{SYMBOL_INDEX}} reviewer block — for the
+   * symbols this PR touches, where each is DECLARED across the repo. A cheap,
+   * zero-dep ALTERNATIVE context source to the `typescript`-backed symbol service
+   * (`tsSymbols`). Selects the flagged reviewer variant (v13). Default OFF — it
+   * runs a whole-repo scan (many reads), so it stays opt-in like
+   * crossFileCallers/historyContext; pending live-eval measurement. Fail-soft.
+   */
+  ctagsIndex?: boolean;
+  /** Overrides for the ctags-lite whole-repo scan budget; see DEFAULT_CTAGS_CAPS. */
+  ctagsCaps?: AgenticCaps;
   /**
    * Local path to the repo's EXISTING CI/lint/type-checker output — SARIF,
    * ESLint JSON, or raw `tsc` text (report item #16). When set, the engine
@@ -333,6 +453,28 @@ export interface EngineConfig {
    * protects Loupe itself; set false only to disable for debugging.
    */
   injectionDefense?: boolean;
+  /**
+   * Feedback-observability capture (report item #12): when reading Loupe's own
+   * prior comments (the dedupe fetch), ALSO read reaction counts (👍/👎/👀 —
+   * free, already in the REST payload) and each comment's review-thread
+   * resolution state (one extra GraphQL call), classify accepted/disputed/
+   * unresolved, and record it to the run log. PURE OBSERVABILITY — never changes
+   * what is posted; fail-soft. Requires `botIdentity` (only Loupe's OWN comments
+   * are classified). Default OFF — it costs one GraphQL call per run (free-tier-
+   * first, like historyContext/crossFileCallers). Feeds the learned-rule
+   * suggestion queue (report item #31).
+   */
+  feedbackCapture?: boolean;
+  /**
+   * Learned-rule suggestion queue (report item #31): when set, after the run the
+   * engine mines the run-log feedback (report item #12) across runs and writes
+   * SUGGESTED `.aireview.toml` ignore globs / `HOUSE_RULES.md` suppress lines to
+   * this LOCAL path. NEVER auto-applied — a human hand-copies the ones they
+   * agree with. Absent → not generated. Requires `runLogPath` (the source log).
+   */
+  suggestionsPath?: string;
+  /** Distinct disputed/ignored findings before a rule is suggested (report item #31). Default 2. */
+  suggestionMinSupport?: number;
 }
 
 /** A file excluded before review, with the reason, for summary disclosure. */
@@ -350,7 +492,15 @@ export type SuppressReason =
   | "unchanged-code"
   | "house-rule"
   | "below-min-severity"
-  | "ignored-file";
+  | "ignored-file"
+  /**
+   * Empirical calibration pre-suppression (report item #29): a finding whose
+   * (category, severity) shape has a persistently low historical verifier
+   * keep-rate in the run-log history. Removed BEFORE the verifier as a cheap
+   * zero-inference prior; recorded here, never silently dropped. Flag-gated
+   * (`empiricalCalibration`), default off, pending live-eval measurement.
+   */
+  | "low-keep-rate";
 
 export interface SuppressedFinding {
   finding: Finding;
@@ -448,6 +598,12 @@ export interface ReviewResult {
    * the `walkthrough` flag is on and the model emitted a non-empty field.
    */
   walkthrough?: string;
+  /**
+   * Feedback observability (report item #12): how the developer reacted to
+   * Loupe's OWN prior comments on this PR, classified accepted/disputed/
+   * unresolved. Present only when `feedbackCapture` is on. Pure observability.
+   */
+  feedback?: import("./feedback").FeedbackReport;
 }
 
 const SEVERITY_RANK: Record<Severity, number> = {

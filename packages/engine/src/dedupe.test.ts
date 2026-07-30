@@ -7,6 +7,7 @@ import {
   isDuplicate,
   nearDuplicateKey,
   normalizeSubstance,
+  parseReactions,
 } from "./dedupe";
 import type { FetchLike } from "./diff";
 import type { Finding } from "./types";
@@ -169,5 +170,52 @@ describe("fetchExistingComments", () => {
       throw new Error("network down");
     };
     expect(await fetchExistingComments(pr, "tok", failing)).toEqual({ reviewComments: [], issueComments: [] });
+  });
+
+  it("captures the comment id + reaction tallies for feedback observability (#12)", async () => {
+    const fake: FetchLike = async (url) => ({
+      ok: true,
+      status: 200,
+      text: async () =>
+        url.includes("/pulls/")
+          ? JSON.stringify([
+              {
+                id: 555,
+                path: "a.ts",
+                line: 3,
+                body: "bot inline",
+                user: { login: "bot" },
+                reactions: { "+1": 0, "-1": 2, eyes: 1, confused: 0 },
+              },
+            ])
+          : JSON.stringify([{ id: 11, body: "bot summary", user: { login: "bot" } }]),
+    });
+    const existing = await fetchExistingComments(pr, "tok", fake, "bot");
+    expect(existing.reviewComments[0]).toEqual({
+      path: "a.ts",
+      line: 3,
+      body: "bot inline",
+      id: 555,
+      reactions: { up: 0, down: 2, eyes: 1, confused: 0 },
+    });
+    // No reactions on the summary → the field stays undefined (toEqual-clean).
+    expect(existing.issueComments[0].reactions).toBeUndefined();
+  });
+});
+
+describe("parseReactions (feature #12)", () => {
+  it("maps the GitHub reaction summary to tallies", () => {
+    expect(parseReactions({ "+1": 3, "-1": 1, eyes: 2, confused: 0, laugh: 5 })).toEqual({
+      up: 3,
+      down: 1,
+      eyes: 2,
+      confused: 0,
+    });
+  });
+
+  it("returns undefined when absent or all-zero", () => {
+    expect(parseReactions(undefined)).toBeUndefined();
+    expect(parseReactions(null)).toBeUndefined();
+    expect(parseReactions({ "+1": 0, "-1": 0, eyes: 0, confused: 0 })).toBeUndefined();
   });
 });

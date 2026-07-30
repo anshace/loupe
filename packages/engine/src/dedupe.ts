@@ -8,6 +8,37 @@
 import type { FetchLike } from "./diff";
 import type { AuthToken, Finding, PrIdentity } from "./types";
 
+/**
+ * Reaction tallies on one of the bot's own prior comments (feature #12).
+ * Captured from the `reactions` summary object GitHub already returns in the
+ * comment-list responses (no extra call). Undefined on an ExistingComment when
+ * the comment carried no reactions at all.
+ */
+export interface ReactionCounts {
+  /** 👍 (`+1`) — a weak "I agree" signal. */
+  up: number;
+  /** 👎 (`-1`) — the dispute signal. */
+  down: number;
+  /** 👀 (`eyes`) — acknowledgment / "seen", classified as neither. */
+  eyes: number;
+  /** 😕 (`confused`) — a soft dispute signal. */
+  confused: number;
+}
+
+/**
+ * Parse the GitHub reaction summary object into tallies (feature #12). Returns
+ * undefined when the object is absent or every relevant count is zero, so an
+ * ExistingComment stays clean (and toEqual-stable) when there is no feedback.
+ */
+export function parseReactions(raw: unknown): ReactionCounts | undefined {
+  if (raw === null || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  const num = (k: string): number => (typeof r[k] === "number" && r[k] >= 0 ? (r[k] as number) : 0);
+  const counts: ReactionCounts = { up: num("+1"), down: num("-1"), eyes: num("eyes"), confused: num("confused") };
+  if (counts.up === 0 && counts.down === 0 && counts.eyes === 0 && counts.confused === 0) return undefined;
+  return counts;
+}
+
 /** A previously posted comment, flattened for matching. */
 export interface ExistingComment {
   /** File path for inline review comments; undefined for issue comments. */
@@ -15,12 +46,22 @@ export interface ExistingComment {
   /** Line for inline review comments. */
   line?: number;
   body: string;
+  /**
+   * The review comment's REST `id` (== GraphQL databaseId), used to join a
+   * comment to its review thread's resolution state (feature #12). Undefined
+   * for issue comments and when the raw payload omitted it.
+   */
+  id?: number;
+  /** Reaction tallies captured for feedback observability (feature #12). */
+  reactions?: ReactionCounts;
 }
 
 export interface ExistingIssueComment {
   id: number;
   body: string;
   user?: string;
+  /** Reaction tallies captured for feedback observability (feature #12). */
+  reactions?: ReactionCounts;
 }
 
 export interface ExistingComments {
@@ -172,17 +213,20 @@ const GH_HEADERS = (auth: AuthToken): Record<string, string> => ({
 });
 
 interface RawReviewComment {
+  id?: number;
   path?: string;
   line?: number | null;
   original_line?: number | null;
   body?: string;
   user?: { login?: string };
+  reactions?: unknown;
 }
 
 interface RawIssueComment {
   id?: number;
   body?: string;
   user?: { login?: string };
+  reactions?: unknown;
 }
 
 async function fetchJsonArray(url: string, auth: AuthToken, fetchImpl: FetchLike): Promise<unknown[]> {
@@ -224,6 +268,8 @@ export async function fetchExistingComments(
       path: entry.path,
       line: typeof line === "number" ? line : undefined,
       body: entry.body,
+      id: typeof entry.id === "number" ? entry.id : undefined,
+      reactions: parseReactions(entry.reactions),
     });
   }
 
@@ -231,7 +277,12 @@ export async function fetchExistingComments(
   for (const entry of rawIssue as RawIssueComment[]) {
     if (typeof entry?.body !== "string" || typeof entry?.id !== "number") continue;
     if (!mine(entry.user?.login)) continue;
-    issueComments.push({ id: entry.id, body: entry.body, user: entry.user?.login });
+    issueComments.push({
+      id: entry.id,
+      body: entry.body,
+      user: entry.user?.login,
+      reactions: parseReactions(entry.reactions),
+    });
   }
 
   return { reviewComments, issueComments };

@@ -6,7 +6,7 @@
 import { Hono } from "hono";
 import { InstallationTokenCache } from "./appAuth";
 import type { HandlerDeps, WorkerEnv } from "./handlers";
-import { handleCommandDispatch, handleReviewDispatch } from "./handlers";
+import { handleCommandDispatch, handleReplyDispatch, handleReviewDispatch } from "./handlers";
 import { mapWebhook } from "./route";
 import { verifyWebhookSignature } from "./verify";
 
@@ -47,10 +47,14 @@ export function createApp(deps: HandlerDeps = {}): Hono<{ Bindings: WorkerEnv }>
     const dispatch = mapWebhook(c.req.header("x-github-event"), payload);
     if (dispatch.kind === "ignore") return c.body(null, 204);
 
-    const work =
-      dispatch.kind === "review"
-        ? handleReviewDispatch(dispatch, c.env, tokens(c.env), deps)
-        : handleCommandDispatch(dispatch, c.env, tokens(c.env), deps);
+    let work: Promise<unknown>;
+    if (dispatch.kind === "review") {
+      work = handleReviewDispatch(dispatch, c.env, tokens(c.env), deps);
+    } else if (dispatch.kind === "reply") {
+      work = handleReplyDispatch(dispatch, c.env, tokens(c.env), deps);
+    } else {
+      work = handleCommandDispatch(dispatch, c.env, tokens(c.env), deps);
+    }
 
     // Production consideration: GitHub's delivery timeout is ~10s, while a
     // review run (diff fetch + model call + posting) can take far longer.

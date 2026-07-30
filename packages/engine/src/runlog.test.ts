@@ -76,4 +76,15 @@ describe("summarizeRunLog", () => {
     expect(summary.incrementalRuns).toBe(1);
     expect(summary.byModel).toEqual({ mock: 1, "claude-haiku-4-5": 1 });
   });
+
+  it("rolls up feedback tallies across runs, zeroed when absent (#12)", () => {
+    const noFeedback = summarizeRunLog([record()]);
+    expect(noFeedback.feedback).toEqual({ accepted: 0, disputed: 0, unresolved: 0, total: 0 });
+
+    const withFeedback = summarizeRunLog([
+      record({ feedback: { accepted: 1, disputed: 2, unresolved: 0, total: 3 } }),
+      record({ feedback: { accepted: 0, disputed: 1, unresolved: 4, total: 5 } }),
+    ]);
+    expect(withFeedback.feedback).toEqual({ accepted: 1, disputed: 3, unresolved: 4, total: 8 });
+  });
 });

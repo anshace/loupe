@@ -55,7 +55,7 @@ interface Recorded {
 }
 
 /** Mock GitHub API recording every call, with a per-user permission table. */
-function mockGitHub(permissions: Record<string, string> = { alice: "write" }) {
+function mockGitHub(permissions: Record<string, string> = { alice: "write" }, reviewCommentAuthor = "review-bot[bot]") {
   const calls: Recorded[] = [];
   const fetchImpl: FetchLike = async (url, init) => {
     const method = init?.method ?? "GET";
@@ -79,6 +79,21 @@ function mockGitHub(permissions: Record<string, string> = { alice: "write" }) {
       const user = decodeURIComponent(/\/collaborators\/([^/]+)\/permission$/.exec(url)![1]);
       const permission = permissions[user];
       return permission ? respond("permission", { permission }) : respond("permission", "Not Found", 404);
+    }
+    // Threaded-reply path (report item #32) — must precede the /pulls/42 checks.
+    if (/\/pulls\/comments\/\d+\/reactions$/.test(url) && method === "POST") {
+      return respond("reply-eyes-reaction", { id: 3, content: "eyes" }, 201);
+    }
+    if (/\/pulls\/comments\/\d+$/.test(url)) {
+      return respond("fetch-review-comment", {
+        user: { login: reviewCommentAuthor },
+        body: "IDOR: unchecked id used in a lookup.",
+        diff_hunk: "@@ -1 +1 @@\n-old\n+const u = users[req.query.id];",
+        path: "api/user.ts",
+      });
+    }
+    if (/\/pulls\/42\/comments\/\d+\/replies$/.test(url) && method === "POST") {
+      return respond("post-reply", { id: 4 });
     }
     if (/\/issues\/comments\/\d+\/reactions$/.test(url)) {
       return respond("eyes-reaction", { id: 1, content: "eyes" }, 201);
@@ -107,8 +122,10 @@ interface TestHarness {
   review: ReturnType<typeof vi.fn>;
 }
 
-function harness(deps: Partial<HandlerDeps> & { permissions?: Record<string, string> } = {}): TestHarness {
-  const { calls, fetchImpl } = mockGitHub(deps.permissions);
+function harness(
+  deps: Partial<HandlerDeps> & { permissions?: Record<string, string>; reviewCommentAuthor?: string } = {},
+): TestHarness {
+  const { calls, fetchImpl } = mockGitHub(deps.permissions, deps.reviewCommentAuthor);
   const review = vi.fn(async () => {
     calls.push({ label: "run-review", url: "(engine)", method: "CALL" });
     return FAKE_RESULT;
@@ -320,6 +337,83 @@ describe("POST /webhook — /ask command (5.6)", () => {
     await h.request(comment("/ask what does this do?"), "issue_comment");
     await h.flush();
     expect(h.calls.map((c) => c.label)).toEqual(["mint-token", "permission"]);
+  });
+});
+
+function reviewComment(body: string, user = "alice"): Record<string, unknown> {
+  return {
+    action: "created",
+    pull_request: { number: 42 },
+    comment: {
+      id: 901,
+      in_reply_to_id: 900,
+      body,
+      user: { login: user },
+      diff_hunk: "@@ -1 +1 @@\n-old\n+const u = users[req.query.id];",
+      path: "api/user.ts",
+    },
+    sender: { login: user },
+    ...repoParts,
+  };
+}
+
+describe("POST /webhook — in-thread reply (report item #32)", () => {
+  it("answers a collaborator's reply under Loupe's finding, in-thread, ack first", async () => {
+    const model = new MockProvider("Yes — still an IDOR; auth does not scope the record to the caller.");
+    const h = harness({ model });
+    const res = await h.request(reviewComment("is this really exploitable?"), "pull_request_review_comment");
+    expect(res.status).toBe(202);
+    await h.flush();
+
+    // Contract ordering: token → permission → ownership check → ack → answer.
+    expect(h.calls.map((c) => c.label)).toEqual([
+      "mint-token",
+      "permission",
+      "fetch-review-comment",
+      "reply-eyes-reaction",
+      "post-reply",
+    ]);
+    expect(model.requests).toHaveLength(1);
+    expect(model.requests[0].user).toContain("is this really exploitable?");
+    expect(model.requests[0].user).toContain("users[req.query.id]"); // grounded in the hunk
+    const posted = JSON.parse(h.calls.find((c) => c.label === "post-reply")!.body!) as { body: string };
+    expect(posted.body).toContain("Yes — still an IDOR");
+    expect(posted.body).toContain("🤖");
+    expect(h.review).not.toHaveBeenCalled();
+  });
+
+  it("stays completely silent for a non-collaborator reply", async () => {
+    const h = harness({ permissions: { alice: "read" } });
+    const res = await h.request(reviewComment("bump"), "pull_request_review_comment");
+    expect(res.status).toBe(202);
+    await h.flush();
+    expect(h.calls.map((c) => c.label)).toEqual(["mint-token", "permission"]);
+  });
+
+  it("stays out of a thread that is NOT one of Loupe's findings", async () => {
+    const h = harness({ reviewCommentAuthor: "some-human" });
+    await h.request(reviewComment("thoughts?"), "pull_request_review_comment");
+    await h.flush();
+    // Fetches the parent to check ownership, then bails — no ack, no reply.
+    expect(h.calls.map((c) => c.label)).toEqual(["mint-token", "permission", "fetch-review-comment"]);
+  });
+
+  it("never answers its OWN threaded reply (loop guard)", async () => {
+    const h = harness();
+    const res = await h.request(reviewComment("🤖 ...", "review-bot[bot]"), "pull_request_review_comment");
+    expect(res.status).toBe(202);
+    await h.flush();
+    expect(h.calls).toHaveLength(0); // self-guard bails before any I/O
+  });
+
+  it("answers 204 for a top-level review comment (not a reply)", async () => {
+    const payload = reviewComment("looks off");
+    delete (payload.comment as Record<string, unknown>).in_reply_to_id;
+    const h = harness();
+    const res = await h.request(payload, "pull_request_review_comment");
+    expect(res.status).toBe(204);
+    await h.flush();
+    expect(h.calls).toHaveLength(0);
   });
 });
 

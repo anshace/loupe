@@ -25,13 +25,27 @@
  *   node evals/run.mjs --snapshot [--update]
  *                                          golden full-output diff; --update writes
  *                                          evals/snapshots.json, else fails on drift
+ *   node evals/run.mjs --shadow --shadowConfig='{"verify":true}' [--primaryConfig='{}']
+ *                                          shadow-mode dual-run: score a SHADOW config
+ *                                          alongside the authoritative PRIMARY, report
+ *                                          per-case "if promoted" deltas; the shadow
+ *                                          never affects the primary (isolation-checked)
  */
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { appendHistory, buildHistoryHtml, computeMetrics, makeHistoryRecord } from "./history.mjs";
-import { comparePaired, diffSnapshots, mcnemar, snapshotCase, snapshotClean } from "./harness.mjs";
+import {
+  comparePaired,
+  diffSnapshots,
+  mcnemar,
+  shadowCompare,
+  shadowSummary,
+  snapshotCase,
+  snapshotClean,
+} from "./harness.mjs";
+import { cohensKappa, kappaLabel } from "./calibration.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const engine = await import(pathToFileURL(join(here, "..", "packages", "engine", "dist", "index.js")).href);
@@ -287,6 +301,21 @@ async function abTest() {
     `McNemar: A-only wins ${mc.aOnly}, B-only wins ${mc.bOnly}, χ²=${mc.statistic} ` +
       `(${mc.significant ? "SIGNIFICANT at α=0.05" : "not significant"}${mc.underpowered ? "; UNDERPOWERED — too few discordant cases to trust" : ""})`,
   );
+
+  // Model/prompt-swap agreement (report item #30): Cohen's kappa over the paired
+  // per-case success labels — how much the judgment PATTERN shifted between the
+  // two configs, chance-corrected. A distinct, cheaper signal than precision/
+  // recall: it catches "quietly became a different reviewer" drift.
+  const kappa = cohensKappa(
+    pairs.map((p) => (p.successA ? "pass" : "fail")),
+    pairs.map((p) => (p.successB ? "pass" : "fail")),
+  );
+  if (kappa) {
+    console.log(
+      `Cohen's kappa (A vs B per-case success): ${kappa.kappa} ` +
+        `(${kappaLabel(kappa.kappa)} agreement, po=${kappa.po}, pe=${kappa.pe}, n=${kappa.n})`,
+    );
+  }
   return 0; // A/B is informational; it never fails the build on its own
 }
 
@@ -323,6 +352,64 @@ async function snapshotMode() {
   }
   console.log("  If this change is intended, re-baseline with '--snapshot --update'.");
   return 1;
+}
+
+// ── Mode: shadow-mode dual-run (rounding-out; builds on the #24 A/B harness) ──
+const signed = (n) => `${n >= 0 ? "+" : ""}${n}`;
+async function shadowMode() {
+  const primaryConfig = parseConfig("--primaryConfig");
+  const shadowConfig = parseConfig("--shadowConfig");
+  console.log(
+    `eval shadow: PRIMARY=${JSON.stringify(primaryConfig)} (authoritative — would be posted)  |  ` +
+      `SHADOW=${JSON.stringify(shadowConfig)} (scored alongside — never posted)\n`,
+  );
+
+  const primary = await runCorpus(primaryConfig);
+  const shadow = await runCorpus(shadowConfig);
+
+  // Isolation guarantee ("scored alongside, without one affecting the other"):
+  // re-run the primary AFTER the shadow and assert its outcome is byte-identical.
+  // A difference means the shadow run mutated shared state that leaked into the
+  // primary — the exact thing shadow mode must never do.
+  const primaryAgain = await runCorpus(primaryConfig);
+  const leak = rowsIdentical(primary.rows, primaryAgain.rows);
+  if (leak.length === 0) {
+    console.log("isolation: OK — primary outcome is identical whether or not the shadow ran.\n");
+  } else {
+    console.log(`isolation: BROKEN — primary changed after the shadow run (${leak.length} case(s)):`);
+    for (const m of leak) console.log(`    - ${m}`);
+    if (!liveMode) {
+      console.log("eval shadow: aborting — isolation broken offline (harness bug: shadow leaked into primary).");
+      return 2;
+    }
+    console.log("");
+  }
+
+  const cases = shadowCompare(primary.rows, shadow.rows);
+  const differing = cases.filter((c) => c.differs);
+  console.log(`per-case shadow deltas (shadow − primary), ${differing.length} of ${cases.length} case(s) would change:`);
+  if (differing.length === 0) console.log("  (none — the shadow would post the same outcome on every case)");
+  for (const c of differing) {
+    console.log(
+      `  ${c.name}: found ${signed(c.foundDelta)}, missed ${signed(c.missedDelta)}, ` +
+        `unexpected ${signed(c.unexpectedDelta)}  [${c.verdict}]`,
+    );
+  }
+
+  const sum = shadowSummary(cases);
+  const mP = computeMetrics(primary.totals);
+  const mS = computeMetrics(shadow.totals);
+  console.log(
+    `\naggregate: precision ${mP.precision}→${mS.precision}, recall ${mP.recall}→${mS.recall}, ` +
+      `fpRate ${mP.fpRate}→${mS.fpRate}`,
+  );
+  console.log(
+    `if promoted: ${sum.changed}/${sum.total} case(s) change — ` +
+      `+${sum.newlyCaught} newly caught, +${sum.newlyMissed} newly missed, ` +
+      `+${sum.newFPs} new potential FP, −${sum.fewerFPs} fewer potential FP`,
+  );
+  console.log("shadow output is informational only — it is never posted and never affects the primary.");
+  return 0; // shadow mode is a decision aid; it never fails the build on its own
 }
 
 // ── Mode: default run (+ optional --history append) ─────────────────────────
@@ -367,6 +454,7 @@ async function defaultMode() {
 // ── Dispatch ────────────────────────────────────────────────────────────────
 let exitCode;
 if (hasFlag("--ab")) exitCode = await abTest();
+else if (hasFlag("--shadow")) exitCode = await shadowMode();
 else if (hasFlag("--snapshot")) exitCode = await snapshotMode();
 else if (hasFlag("--selftest")) exitCode = (await selfTest(parseConfig("--configA"))) ? 0 : 1;
 else exitCode = await defaultMode();

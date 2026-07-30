@@ -18,6 +18,7 @@ import type { ToolCallRequest } from "./guardrail";
 import { findImporters } from "./importgraph";
 import type { ModelResponse, ReviewModel } from "./model";
 import type { RenderedPrompt } from "./prompt";
+import type { SymbolRef, SymbolService } from "./symbols";
 import type { AgenticCaps, AgenticUsage, AuthToken, PrIdentity } from "./types";
 
 export const DEFAULT_AGENTIC_CAPS: Required<AgenticCaps> = {
@@ -176,12 +177,49 @@ async function runFindImporters(
   return `${header}\nFiles importing ${path} (${importers.length}):\n${list}${note}`;
 }
 
+function formatRef(r: SymbolRef): string {
+  return `- ${r.path}:${r.line}:${r.column}: ${r.text}`;
+}
+
+/** find_definition / find_references / hover, backed by the injected SymbolService. */
+async function runSymbolTool(
+  call: ToolCallRequest,
+  symbols: SymbolService | undefined,
+): Promise<string> {
+  const label = `[${call.tool} ${call.symbol}${call.line !== undefined ? `@${call.line}` : ""} in ${call.path}]`;
+  if (!symbols) {
+    return `${label} refused: TS symbol tools are not available this run`;
+  }
+  const query = { path: call.path as string, symbol: call.symbol as string, line: call.line };
+  try {
+    if (call.tool === "hover") {
+      const info = await symbols.hover(query);
+      return info ? `${label}\n${info}` : `${label}\nNo hover/type information found.`;
+    }
+    const refs =
+      call.tool === "find_definition"
+        ? await symbols.findDefinition(query)
+        : await symbols.findReferences(query);
+    if (refs.length === 0) {
+      const noun = call.tool === "find_definition" ? "definition" : "reference";
+      return `${label}\nNo ${noun}s found (symbol may be undeclared, or in a file outside the loaded set).`;
+    }
+    const shown = refs.slice(0, MAX_GREP_MATCHES);
+    const note = refs.length > shown.length ? `\n[${refs.length - shown.length} more omitted]` : "";
+    const kind = call.tool === "find_definition" ? "Definition(s)" : `Reference(s) (${refs.length})`;
+    return `${label}\n${kind}:\n${shown.map(formatRef).join("\n")}${note}`;
+  } catch {
+    return `${label} failed: the symbol service errored (continuing)`;
+  }
+}
+
 /** Execute one hop's tool calls under the caps; returns the results block. */
 export async function executeToolCalls(
   calls: readonly ToolCallRequest[],
   reader: RepoReader,
   caps: Required<AgenticCaps>,
   usage: AgenticUsage,
+  symbols?: SymbolService,
 ): Promise<string> {
   const parts: string[] = [];
   for (const call of calls.slice(0, MAX_CALLS_PER_HOP)) {
@@ -189,6 +227,8 @@ export async function executeToolCalls(
       parts.push(await runReadFile(call.path as string, reader, caps, usage));
     } else if (call.tool === "find_importers") {
       parts.push(await runFindImporters(call, reader, caps, usage));
+    } else if (call.tool === "find_definition" || call.tool === "find_references" || call.tool === "hover") {
+      parts.push(await runSymbolTool(call, symbols));
     } else {
       parts.push(await runGrep(call, reader, caps, usage));
     }
@@ -204,6 +244,13 @@ export interface AgenticOptions {
   caps?: AgenticCaps;
   /** Shared counters so reviewer + verifier draw from ONE per-run budget. */
   usage?: AgenticUsage;
+  /**
+   * Injected TS language service (report item #33). When present, the
+   * find_definition / find_references / hover tools are executable; when absent,
+   * those tool calls are answered "not available this run". Loads PR-head files
+   * on its own budget — it does not draw from the reader byte caps above.
+   */
+  symbols?: SymbolService;
 }
 
 export interface AgenticResult {
@@ -253,7 +300,7 @@ export async function agenticComplete(
       continue;
     }
     usage.hops += 1;
-    const results = await executeToolCalls(calls, agentic.reader, caps, usage);
+    const results = await executeToolCalls(calls, agentic.reader, caps, usage, agentic.symbols);
     user += `\n\n---\n\nYour previous response requested tools:\n${response.text}\n\nTool results:\n${results}\n\nContinue: request more tools if needed (within budget) or respond with ONLY the required JSON array.`;
   }
 }

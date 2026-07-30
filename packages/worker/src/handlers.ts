@@ -20,6 +20,7 @@ import {
   GeminiFlashProvider,
   GroqProvider,
   KvStateStore,
+  answerThreadReply,
   buildProvider,
   fetchPrDiff,
   resolveProviderChoice,
@@ -27,7 +28,15 @@ import {
 } from "@code-review/engine";
 import type { InstallationTokenCache } from "./appAuth";
 import { REVIEWER_PROMPT_TEMPLATE } from "./generated/promptTemplate";
-import { addEyesReaction, fetchPrHead, isCollaboratorWithWrite, postIssueComment } from "./github";
+import {
+  addEyesReaction,
+  addEyesReactionToReviewComment,
+  fetchPrHead,
+  fetchReviewComment,
+  isCollaboratorWithWrite,
+  postIssueComment,
+  postReviewCommentReply,
+} from "./github";
 import type { WebhookDispatch } from "./route";
 
 export interface WorkerEnv {
@@ -221,4 +230,48 @@ export async function handleCommandDispatch(
   };
   const review = deps.review ?? runReview;
   return review(dispatch.pr, token, config, runDeps);
+}
+
+/**
+ * Conversational in-thread reply (report item #32). Order is contract:
+ *   1. self-loop guard — never answer Loupe's OWN threaded replies;
+ *   2. permission gate — non-collaborators are ignored COMPLETELY (like /ask);
+ *   3. ownership check — the thread must be one of Loupe's OWN findings (the
+ *      parent comment's author is the bot), else stay out of the thread;
+ *   4. 👀 ack on the reply, then one grounded model answer posted in-thread.
+ * Requires a configured BOT_LOGIN to know which threads are Loupe's; without it,
+ * ownership cannot be confirmed and the reply is left alone. All I/O fail-soft
+ * against the injected fetch — never touches the review pipeline.
+ */
+export async function handleReplyDispatch(
+  dispatch: Extract<WebhookDispatch, { kind: "reply" }>,
+  env: WorkerEnv,
+  tokens: InstallationTokenCache,
+  deps: HandlerDeps = {},
+): Promise<void> {
+  // Without a known bot identity we cannot tell our own threads from anyone
+  // else's — and (1) never answer our own reply (infinite-loop guard).
+  if (!env.BOT_LOGIN || dispatch.commenter === env.BOT_LOGIN) return;
+
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const token = await tokens.getToken(dispatch.installationId);
+
+  const allowed = await isCollaboratorWithWrite(dispatch.pr, dispatch.commenter, token, fetchImpl);
+  if (!allowed) return; // silence is the spec: no answer, no reaction
+
+  // Confirm the reply sits under one of Loupe's OWN inline findings.
+  const parent = await fetchReviewComment(dispatch.pr, dispatch.inReplyToId, token, fetchImpl);
+  if (parent.author !== env.BOT_LOGIN) return; // not our finding — stay out of the thread
+
+  await addEyesReactionToReviewComment(dispatch.pr, dispatch.commentId, token, fetchImpl);
+
+  const model = deps.model ?? buildModel(env, fetchImpl);
+  const answer = await answerThreadReply(model, {
+    // Prefer the hunk carried on the reply payload; fall back to the parent's.
+    diffHunk: dispatch.diffHunk || parent.diffHunk || "",
+    path: dispatch.path ?? parent.path,
+    findingBody: parent.body,
+    reply: dispatch.body,
+  });
+  await postReviewCommentReply(dispatch.pr, dispatch.inReplyToId, `🤖 ${answer}`, token, fetchImpl);
 }

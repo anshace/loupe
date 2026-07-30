@@ -224,3 +224,33 @@ describe("applyVerdicts — abstention (feature #6)", () => {
     expect(out.dropped[0].evidence).toBe("helper not in the diff");
   });
 });
+
+describe("verifier confidence field (report item #30)", () => {
+  it("parses a [0,1] confidence and a 0–100 percentage spelling", () => {
+    const out = parseVerifierOutput(
+      '[{"id":1,"verdict":"keep","confidence":0.9},{"id":2,"verdict":"keep","confidence":80},{"id":3,"verdict":"keep","confidence":"0.4"}]',
+    );
+    expect(out?.map((d) => d.confidence)).toEqual([0.9, 0.8, 0.4]);
+  });
+
+  it("clamps out-of-range values and leaves absent confidence undefined", () => {
+    const out = parseVerifierOutput('[{"id":1,"verdict":"keep","confidence":1.7},{"id":2,"verdict":"keep"}]');
+    expect(out?.[0].confidence).toBe(1);
+    expect(out?.[1].confidence).toBeUndefined();
+  });
+
+  it("applyVerdicts captures confidences of KEPT findings in kept order", () => {
+    const out = applyVerdicts(FINDINGS, [
+      { id: 1, verdict: "keep", confidence: 0.7 },
+      { id: 2, verdict: "drop", reason: "false-claim", evidence: "src/a.ts:3 — qty" },
+      { id: 3, verdict: "keep", confidence: 0.2 },
+    ]);
+    // id 2 is dropped (its confidence is not a kept-confidence).
+    expect(out.keptConfidences).toEqual([0.7, 0.2]);
+  });
+
+  it("keptConfidences is empty when no verdict supplies one", () => {
+    const out = applyVerdicts(FINDINGS, [{ id: 1, verdict: "keep" }]);
+    expect(out.keptConfidences).toEqual([]);
+  });
+});

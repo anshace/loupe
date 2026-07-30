@@ -116,6 +116,70 @@ describe("mapWebhook — issue_comment", () => {
   });
 });
 
+function reviewCommentPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    action: "created",
+    pull_request: { number: 42 },
+    comment: {
+      id: 901,
+      in_reply_to_id: 900,
+      body: "is this really exploitable?",
+      user: { login: "alice" },
+      diff_hunk: "@@ -1 +1 @@\n-old\n+new",
+      path: "src/a.ts",
+    },
+    sender: { login: "alice" },
+    ...repoParts,
+    ...overrides,
+  };
+}
+
+describe("mapWebhook — pull_request_review_comment (report item #32)", () => {
+  it("dispatches a reply carrying the thread root, hunk, and reply body", () => {
+    expect(mapWebhook("pull_request_review_comment", reviewCommentPayload())).toEqual({
+      kind: "reply",
+      pr: { owner: "owner", repo: "repo", prNumber: 42 },
+      installationId: 555,
+      commenter: "alice",
+      commentId: 901,
+      inReplyToId: 900,
+      body: "is this really exploitable?",
+      diffHunk: "@@ -1 +1 @@\n-old\n+new",
+      path: "src/a.ts",
+    });
+  });
+
+  it("ignores a top-level review comment (no in_reply_to_id)", () => {
+    const payload = reviewCommentPayload();
+    delete (payload.comment as Record<string, unknown>).in_reply_to_id;
+    expect(mapWebhook("pull_request_review_comment", payload)).toMatchObject({
+      kind: "ignore",
+      reason: /not a reply/,
+    });
+  });
+
+  it("ignores edited/deleted review comments", () => {
+    expect(mapWebhook("pull_request_review_comment", reviewCommentPayload({ action: "edited" })).kind).toBe(
+      "ignore",
+    );
+    expect(mapWebhook("pull_request_review_comment", reviewCommentPayload({ action: "deleted" })).kind).toBe(
+      "ignore",
+    );
+  });
+
+  it("ignores a payload with no installation id", () => {
+    const payload = reviewCommentPayload();
+    delete payload.installation;
+    expect(mapWebhook("pull_request_review_comment", payload).kind).toBe("ignore");
+  });
+
+  it("tolerates a missing diff_hunk (falls back to empty string)", () => {
+    const payload = reviewCommentPayload();
+    delete (payload.comment as Record<string, unknown>).diff_hunk;
+    expect(mapWebhook("pull_request_review_comment", payload)).toMatchObject({ kind: "reply", diffHunk: "" });
+  });
+});
+
 describe("mapWebhook — everything else", () => {
   it("ignores unhandled event names", () => {
     expect(mapWebhook("push", { ref: "refs/heads/main" }).kind).toBe("ignore");

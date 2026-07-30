@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { DiffFile } from "./diff";
 import {
   REVIEWER_FLAGGED_PROMPT_FILE,
+  REVIEWER_GROUNDING_FIRST_PROMPT_FILE,
   REVIEWER_PROMPT_FILE,
   buildFewShotExemplars,
   buildSecurityChecklist,
@@ -35,6 +36,62 @@ describe("selectReviewerPrompt + few-shot exemplars (report items #14, #26)", ()
     expect(v10).toContain("{{WALKTHROUGH_INSTRUCTION}}");
     expect(v10).toContain("{{RELATED_TESTS}}");
     expect(v10).toContain("{{CODE_HISTORY}}");
+  });
+});
+
+describe("selectReviewerPrompt + grounding-first experiment (report item #28)", () => {
+  it("switches to the reviewer-v12 field-ordering variant when groundingFirst is on", () => {
+    expect(selectReviewerPrompt({ groundingFirst: true })).toBe(REVIEWER_GROUNDING_FIRST_PROMPT_FILE);
+  });
+
+  it("groundingFirst wins over the flagged blocks (a clean-schema experiment)", () => {
+    expect(selectReviewerPrompt({ groundingFirst: true, fewShotExemplars: true, sinkPack: true })).toBe(
+      REVIEWER_GROUNDING_FIRST_PROMPT_FILE,
+    );
+  });
+
+  it("stays on v9 when groundingFirst is off", () => {
+    expect(selectReviewerPrompt({ groundingFirst: false })).toBe(REVIEWER_PROMPT_FILE);
+  });
+
+  it("the v12 template puts the grounding fields (quote + why) before severity and keeps v9's tokens", () => {
+    const v12 = loadPromptTemplate(undefined, REVIEWER_GROUNDING_FIRST_PROMPT_FILE);
+    const quoteAt = v12.indexOf('"quote"');
+    const whyAt = v12.indexOf('"why"');
+    const severityAt = v12.indexOf('"severity"');
+    expect(quoteAt).toBeGreaterThanOrEqual(0);
+    expect(whyAt).toBeGreaterThan(quoteAt);
+    expect(severityAt).toBeGreaterThan(whyAt);
+    expect(v12).toContain("{{DIFF}}");
+    expect(v12).toContain("{{COMMENTABLE_LINES}}");
+    expect(v12).toContain("{{PR_INTENT}}");
+  });
+});
+
+describe("selectReviewerPrompt + repo-map / ctags-lite (rounding-out items)", () => {
+  it("switches to the flagged v13 variant when repoMap or ctagsIndex is on", () => {
+    expect(selectReviewerPrompt({ repoMap: true })).toBe(REVIEWER_FLAGGED_PROMPT_FILE);
+    expect(selectReviewerPrompt({ ctagsIndex: true })).toBe(REVIEWER_FLAGGED_PROMPT_FILE);
+  });
+
+  it("stays on the v9 default when both are off", () => {
+    expect(selectReviewerPrompt({ repoMap: false, ctagsIndex: false })).toBe(REVIEWER_PROMPT_FILE);
+  });
+
+  it("groundingFirst still wins over repo-map / symbol-index", () => {
+    expect(selectReviewerPrompt({ groundingFirst: true, repoMap: true, ctagsIndex: true })).toBe(
+      REVIEWER_GROUNDING_FIRST_PROMPT_FILE,
+    );
+  });
+
+  it("the flagged v13 template carries the new placeholders (and the v11/v9 ones)", () => {
+    const v13 = loadPromptTemplate(undefined, REVIEWER_FLAGGED_PROMPT_FILE);
+    expect(v13).toContain("{{REPO_MAP}}");
+    expect(v13).toContain("{{SYMBOL_INDEX}}");
+    expect(v13).toContain("{{SINK_EVIDENCE}}");
+    expect(v13).toContain("{{FEWSHOT_EXEMPLARS}}");
+    expect(v13).toContain("{{RELATED_TESTS}}");
+    expect(v13).toContain("{{CODE_HISTORY}}");
   });
 });
 
@@ -148,5 +205,20 @@ describe("buildSecurityChecklist (feature #5)", () => {
   it("returns (none) when no known language is present", () => {
     expect(buildSecurityChecklist([{ path: "README.md" }, { path: "data.csv" }])).toBe("(none)");
     expect(buildSecurityChecklist([])).toBe("(none)");
+  });
+
+  it("includes the concurrency / resource-leak classes per language (rounding-out item)", () => {
+    const ts = buildSecurityChecklist([{ path: "src/a.ts" }]);
+    expect(ts).toContain("floating promises");
+    expect(ts).toContain("resource leak");
+    expect(ts).toContain("unbounded");
+
+    const go = buildSecurityChecklist([{ path: "svc/main.go" }]);
+    expect(go).toContain("goroutine leak");
+    expect(go).toContain("data race");
+
+    const py = buildSecurityChecklist([{ path: "svc/main.py" }]);
+    expect(py).toContain("asyncio tasks");
+    expect(py).toContain("resource leak");
   });
 });

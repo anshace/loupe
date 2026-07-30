@@ -244,14 +244,31 @@ export function parseWalkthrough(raw: string): string | undefined {
  * malformed entries, never throw.
  */
 export interface ToolCallRequest {
-  tool: "grep" | "read_file" | "find_importers";
+  tool: "grep" | "read_file" | "find_importers" | "find_definition" | "find_references" | "hover";
   /** grep: the regex/substring to search for. */
   pattern?: string;
-  /** grep: optional path prefix filter; read_file / find_importers: the file. */
+  /** grep: optional path prefix filter; read_file / find_importers / symbol tools: the file. */
   path?: string;
+  /** find_definition / find_references / hover: the identifier name to resolve. */
+  symbol?: string;
+  /** find_definition / find_references / hover: optional 1-based line disambiguator. */
+  line?: number;
 }
 
 const TOOL_WRAPPER_KEYS = ["tool_calls", "toolCalls", "tools", "tool_requests"];
+
+/** Read a positive-integer line argument from a tool call, tolerating strings. */
+function coerceToolLine(obj: Record<string, unknown>): number | undefined {
+  for (const key of ["line", "line_number", "lineNumber", "row"]) {
+    const v = obj[key];
+    if (typeof v === "number" && Number.isInteger(v) && v >= 1) return v;
+    if (typeof v === "string" && /^\d+$/.test(v.trim())) {
+      const n = Number(v.trim());
+      if (n >= 1) return n;
+    }
+  }
+  return undefined;
+}
 
 function coerceToolCall(entry: unknown): ToolCallRequest | undefined {
   if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return undefined;
@@ -286,6 +303,25 @@ function coerceToolCall(entry: unknown): ToolCallRequest | undefined {
     const path = firstString(args, ["path", "file", "filename", "file_path", "filePath", "module"]);
     if (!path) return undefined;
     return { tool: "find_importers", path };
+  }
+  // ── TS language-service tools (report item #33). All three take a file path
+  // + an identifier NAME (offsets are error-prone for an LLM) and an optional
+  // line to disambiguate the occurrence. They are executed only when a
+  // SymbolService is injected (tsSymbols flag); otherwise agentic.ts reports
+  // them unavailable.
+  const symTool =
+    name === "find_definition" || name === "finddefinition" || name === "definition" || name === "goto_definition" || name === "go_to_definition"
+      ? "find_definition"
+      : name === "find_references" || name === "findreferences" || name === "references" || name === "find_refs" || name === "refs" || name === "usages" || name === "find_usages"
+        ? "find_references"
+        : name === "hover" || name === "quick_info" || name === "quickinfo" || name === "type_info" || name === "typeinfo" || name === "type_of"
+          ? "hover"
+          : undefined;
+  if (symTool) {
+    const path = firstString(args, ["path", "file", "filename", "file_path", "filePath"]);
+    const symbol = firstString(args, ["symbol", "name", "identifier", "ident", "target"]);
+    if (!path || !symbol) return undefined;
+    return { tool: symTool, path, symbol, line: coerceToolLine(args) };
   }
   return undefined;
 }

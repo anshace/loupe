@@ -9,6 +9,7 @@
  * clock and the pure pipeline stays reproducible.
  */
 import { appendFileSync, readFileSync } from "node:fs";
+import type { RunLogFeedback } from "./feedback";
 
 export interface RunLogRecord {
   /** PR state key, "owner/repo#number". */
@@ -33,10 +34,37 @@ export interface RunLogRecord {
   abstained: number;
   /** Verifier verdicts whose cited evidence failed the mechanical grounding check (feature #1). */
   verifierUngrounded: number;
+  /**
+   * Self-reported verifier confidences (feature #30) on KEPT findings, when the
+   * verifier supplied them. Recorded raw for later offline calibration scoring
+   * (Brier/ECE) against real accept/reject outcomes. Absent when none present.
+   */
+  verifierConfidences?: number[];
+  /**
+   * Per-(category, severity) shape tallies of what the verifier KEPT vs DROPPED
+   * this run (feature #29). Keyed "category|severity". Mined across runs into a
+   * keep-rate table by the empirical-calibration module. Absent when the verifier
+   * did not run.
+   */
+  verifierShapes?: { kept: Record<string, number>; dropped: Record<string, number> };
+  /** Findings demoted one severity by the bounded reflection pass (feature #27). */
+  reflectionDemoted?: number;
+  /**
+   * Findings pre-suppressed before the verifier by the empirical-calibration
+   * prior (feature #29), because their shape had a persistently low keep-rate.
+   */
+  calibrationSuppressed?: number;
   /** True when the run was escalated to the risky-path model. */
   escalated: boolean;
   /** True when the run reviewed an incremental before..after range. */
   incremental: boolean;
+  /**
+   * Feedback observability (feature #12): how the developer reacted to Loupe's
+   * OWN prior comments on this PR (reactions + thread resolution), classified
+   * accepted/disputed/unresolved. Absent when feedback capture was off. Mined
+   * across runs by the learned-rule suggestion queue (feature #31).
+   */
+  feedback?: RunLogFeedback;
 }
 
 export interface RunLogIo {
@@ -94,6 +122,8 @@ export interface RunLogSummary {
   incrementalRuns: number;
   /** Run count per model. */
   byModel: Record<string, number>;
+  /** Merged feedback tallies across runs (feature #12). */
+  feedback: { accepted: number; disputed: number; unresolved: number; total: number };
 }
 
 /** Tiny self-analytics rollup over run-log records. Pure. */
@@ -112,6 +142,7 @@ export function summarizeRunLog(records: readonly RunLogRecord[]): RunLogSummary
     escalatedRuns: 0,
     incrementalRuns: 0,
     byModel: {},
+    feedback: { accepted: 0, disputed: 0, unresolved: 0, total: 0 },
   };
   for (const r of records) {
     summary.totalInputTokens += r.inputTokens || 0;
@@ -127,6 +158,12 @@ export function summarizeRunLog(records: readonly RunLogRecord[]): RunLogSummary
     if (r.model) summary.byModel[r.model] = (summary.byModel[r.model] ?? 0) + 1;
     for (const [reason, n] of Object.entries(r.dropReasons ?? {})) {
       if (typeof n === "number") summary.dropReasons[reason] = (summary.dropReasons[reason] ?? 0) + n;
+    }
+    if (r.feedback) {
+      summary.feedback.accepted += r.feedback.accepted || 0;
+      summary.feedback.disputed += r.feedback.disputed || 0;
+      summary.feedback.unresolved += r.feedback.unresolved || 0;
+      summary.feedback.total += r.feedback.total || 0;
     }
   }
   return summary;

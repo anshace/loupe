@@ -7,6 +7,7 @@
  * swap the pipeline falls back to the single-line suggestion / prose.
  */
 import { describe, expect, it } from "vitest";
+import type { RepoReader } from "./agentic";
 import type { ExistingComments } from "./dedupe";
 import type { FetchLike } from "./diff";
 import { MockProvider } from "./model";
@@ -108,5 +109,57 @@ describe("runReview — multi-line committable suggestion range (#18)", () => {
     expect(c.startLine).toBeUndefined(); // no range
     expect(c.line).toBe(2);
     expect(c.body).toContain("```suggestion\n  if (!ok) {\n```");
+  });
+});
+
+describe("runReview — repo-map priming + ctags-lite symbol index (rounding-out items)", () => {
+  const treeFiles: Record<string, string> = {
+    "src/guard.ts": FILE_LINES.join("\n"),
+    "src/other.ts": "export function other() {}",
+    "docs/readme.md": "# docs",
+  };
+  const repoReader: RepoReader = {
+    listTree: async () => Object.keys(treeFiles),
+    readFile: async (p) => treeFiles[p],
+  };
+
+  it("fills {{REPO_MAP}} and {{SYMBOL_INDEX}} in the reviewer prompt when both flags are on", async () => {
+    const model = new MockProvider("[]");
+    const { deps } = capture();
+    await runReview(
+      pr,
+      "tok",
+      { ...base, repoMap: true, ctagsIndex: true },
+      {
+        ...deps,
+        fetchImpl: diffFetch(DIFF),
+        model,
+        repoReader,
+        headFiles: { "src/guard.ts": FILE_LINES.join("\n") },
+        // let it load the real reviewer-v13 from prompts/ (no promptTemplate override)
+        promptTemplate: undefined,
+      },
+    );
+    const user = model.requests[0].user;
+    // repo map: top-level structure + exported symbols from the changed file
+    expect(user).toContain("Top-level structure:");
+    expect(user).toContain("- src/ (2 file(s))");
+    expect(user).toContain("- src/guard.ts: guard");
+    // ctags-lite: the touched symbol's declaration location
+    expect(user).toContain("`guard` — defined at src/guard.ts:1 (function)");
+  });
+
+  it("stays on the v9 default (no repo-map block) when the flags are off", async () => {
+    const model = new MockProvider("[]");
+    const { deps } = capture();
+    await runReview(pr, "tok", base, {
+      ...deps,
+      fetchImpl: diffFetch(DIFF),
+      model,
+      repoReader,
+      headFiles: { "src/guard.ts": FILE_LINES.join("\n") },
+      promptTemplate: undefined,
+    });
+    expect(model.requests[0].user).not.toContain("Top-level structure:");
   });
 });

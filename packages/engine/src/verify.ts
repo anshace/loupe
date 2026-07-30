@@ -49,6 +49,14 @@ export interface VerifierDecision {
   evidence?: string;
   reason?: DropReason;
   rewritten?: string;
+  /**
+   * Optional self-reported confidence in [0,1] (report item #30). Captured when
+   * the verifier supplies it so it can be scored (Brier/ECE) offline against
+   * real accept/reject outcomes later. Never affects the verdict itself — the
+   * research flags raw LLM self-confidence as miscalibrated, so it is recorded,
+   * not acted on. Tolerant of a 0–100 percentage spelling (divided to [0,1]).
+   */
+  confidence?: number;
 }
 
 const VERDICT_SYNONYMS: Record<string, VerifierVerdict> = {
@@ -88,6 +96,27 @@ function coerceString(obj: Record<string, unknown>, keys: string[]): string | un
   return undefined;
 }
 
+/**
+ * Coerce an optional confidence value into [0,1] (report item #30). Accepts a
+ * number or numeric string; a value in (1,100] is treated as a percentage and
+ * divided by 100; anything out of range is clamped. Returns undefined when no
+ * usable value is present. Pure.
+ */
+function coerceConfidence(obj: Record<string, unknown>): number | undefined {
+  for (const key of ["confidence", "conf", "certainty", "confidence_score", "confidenceScore"]) {
+    const v = obj[key];
+    let n: number | undefined;
+    if (typeof v === "number" && Number.isFinite(v)) n = v;
+    else if (typeof v === "string" && /^-?\d+(\.\d+)?$/.test(v.trim())) n = Number(v.trim());
+    if (n === undefined) continue;
+    // A WHOLE number in (1,100] is a percentage spelling (80 → 0.8); a
+    // fractional value >1 (e.g. 1.7) is a malformed probability → clamp.
+    if (n > 1 && n <= 100 && Number.isInteger(n)) n = n / 100;
+    return Math.max(0, Math.min(1, n));
+  }
+  return undefined;
+}
+
 function coerceReason(obj: Record<string, unknown>): DropReason | undefined {
   const raw = coerceString(obj, ["reason", "drop_reason", "dropReason", "why"]);
   if (!raw) return undefined;
@@ -110,6 +139,7 @@ function coerceDecision(entry: unknown): VerifierDecision | undefined {
     evidence: coerceString(obj, ["evidence", "citation", "proof"]),
     reason: coerceReason(obj),
     rewritten: coerceString(obj, ["rewritten", "rewrite", "rewritten_body", "rewrittenBody", "new_body"]),
+    confidence: coerceConfidence(obj),
   };
 }
 
@@ -270,6 +300,12 @@ export interface VerificationOutcome {
   rewrittenCount: number;
   /** Verdicts whose cited evidence could not be grounded (feature #1). */
   ungrounded: UngroundedVerdict[];
+  /**
+   * Self-reported confidences (report item #30) attached to KEPT findings, in
+   * kept order — only those verdicts that supplied one. Captured for offline
+   * calibration scoring; never used to decide anything at run time.
+   */
+  keptConfidences: number[];
   /** True when the whole verdict list was unparseable → everything kept. */
   degraded: boolean;
 }
@@ -297,7 +333,14 @@ export function applyVerdicts(
   source?: GroundingSource,
 ): VerificationOutcome {
   if (decisions === undefined) {
-    return { kept: [...findings], dropped: [], rewrittenCount: 0, ungrounded: [], degraded: true };
+    return {
+      kept: [...findings],
+      dropped: [],
+      rewrittenCount: 0,
+      ungrounded: [],
+      keptConfidences: [],
+      degraded: true,
+    };
   }
   const byId = new Map<number, VerifierDecision>();
   for (const d of decisions) if (!byId.has(d.id)) byId.set(d.id, d);
@@ -305,6 +348,7 @@ export function applyVerdicts(
   const kept: Finding[] = [];
   const dropped: DroppedFinding[] = [];
   const ungrounded: UngroundedVerdict[] = [];
+  const keptConfidences: number[] = [];
   let rewrittenCount = 0;
 
   // Flag a kept verdict (keep/rewrite) when its evidence is missing or fabricated.
@@ -318,10 +362,17 @@ export function applyVerdicts(
     }
   };
 
+  const recordConfidence = (decision: VerifierDecision): void => {
+    if (typeof decision.confidence === "number") keptConfidences.push(decision.confidence);
+  };
+
   findings.forEach((finding, i) => {
     const decision = byId.get(i + 1);
     if (!decision || decision.verdict === "keep") {
-      if (decision) flagKept(finding, decision, "keep");
+      if (decision) {
+        flagKept(finding, decision, "keep");
+        recordConfidence(decision);
+      }
       kept.push(finding);
       return;
     }
@@ -329,6 +380,7 @@ export function applyVerdicts(
       const rewritten = decision.rewritten ? { ...finding, body: decision.rewritten } : finding;
       if (decision.rewritten) rewrittenCount += 1;
       flagKept(rewritten, decision, "rewrite");
+      recordConfidence(decision);
       kept.push(rewritten);
       return;
     }
@@ -349,16 +401,18 @@ export function applyVerdicts(
       // never be allowed to kill a real finding.
       if (source && checkGrounding(decision.evidence, source) === "quote-not-found") {
         ungrounded.push({ finding, verdict: "drop", reason: "quote-not-found" });
+        recordConfidence(decision);
         kept.push(finding);
       } else {
         dropped.push({ finding, reason: decision.reason, evidence: decision.evidence });
       }
     } else {
+      recordConfidence(decision);
       kept.push(finding);
     }
   });
 
-  return { kept, dropped, rewrittenCount, ungrounded, degraded: false };
+  return { kept, dropped, rewrittenCount, ungrounded, keptConfidences, degraded: false };
 }
 
 /** Render the numbered findings JSON sent to the verifier ({{FINDINGS}}). */

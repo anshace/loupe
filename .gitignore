@@ -19,6 +19,8 @@ __pycache__/
 .wrangler/
 # Generated eval artifacts (report items #11/#25) — local-only derived output.
 # The trend log (evals/history.jsonl) and golden baseline (evals/snapshots.json)
-# ARE tracked; the rendered HTML and mined cases are regenerated, never committed.
+# ARE tracked; the rendered HTML, mined cases, and adapted public-benchmark cases
+# are regenerated from local sources, never committed.
 evals/history.html
 evals/mined/
+evals/benchmarks/
