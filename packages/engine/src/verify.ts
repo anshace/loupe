@@ -15,6 +15,19 @@ import type { DropReason, DroppedFinding, Finding, UngroundedVerdict } from "./t
 
 export const VERIFIER_PROMPT_FILE = "verifier-v2.md";
 
+/**
+ * Chain-of-verification verifier prompt (report item #13): requires the verifier
+ * to state + answer 1–2 falsifiable questions before each verdict. Same output
+ * schema as v2 (the optional questions are prose the parser ignores), so no
+ * parsing change is needed. Selected only when `chainOfVerification` is on.
+ */
+export const VERIFIER_COVE_PROMPT_FILE = "verifier-v3.md";
+
+/** Pick the verifier prompt file for this run (report item #13). Pure. */
+export function selectVerifierPrompt(chainOfVerification?: boolean): string {
+  return chainOfVerification ? VERIFIER_COVE_PROMPT_FILE : VERIFIER_PROMPT_FILE;
+}
+
 export const DROP_REASONS: readonly DropReason[] = [
   "false-claim",
   "pre-existing",

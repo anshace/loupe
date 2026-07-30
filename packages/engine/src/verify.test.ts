@@ -1,13 +1,25 @@
 import { describe, expect, it } from "vitest";
 import type { Finding } from "./types";
 import {
+  VERIFIER_COVE_PROMPT_FILE,
+  VERIFIER_PROMPT_FILE,
   applyVerdicts,
   buildGroundingSource,
   checkGrounding,
   formatFindingsForVerifier,
   parseCitation,
   parseVerifierOutput,
+  selectVerifierPrompt,
 } from "./verify";
+
+describe("selectVerifierPrompt (report item #13)", () => {
+  it("defaults to v2 and switches to v3 (chain-of-verification) when on", () => {
+    expect(selectVerifierPrompt()).toBe(VERIFIER_PROMPT_FILE);
+    expect(selectVerifierPrompt(false)).toBe(VERIFIER_PROMPT_FILE);
+    expect(selectVerifierPrompt(true)).toBe(VERIFIER_COVE_PROMPT_FILE);
+    expect(VERIFIER_COVE_PROMPT_FILE).toBe("verifier-v3.md");
+  });
+});
 
 const finding = (title: string): Finding => ({
   severity: "high",

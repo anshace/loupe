@@ -1,0 +1,264 @@
+{
+  "clean-add-tests": {
+    "name": "clean-add-tests",
+    "findings": []
+  },
+  "clean-comment-fix": {
+    "name": "clean-comment-fix",
+    "findings": []
+  },
+  "clean-docs-only": {
+    "name": "clean-docs-only",
+    "findings": []
+  },
+  "clean-refactor": {
+    "name": "clean-refactor",
+    "findings": []
+  },
+  "clean-rename-local": {
+    "name": "clean-rename-local",
+    "findings": []
+  },
+  "command-injection": {
+    "name": "command-injection",
+    "findings": [
+      {
+        "severity": "critical",
+        "category": "security",
+        "file": "src/convert.js",
+        "line": 4,
+        "title": "Command injection via user-controlled path",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "cross-file-signature-break": {
+    "name": "cross-file-signature-break",
+    "findings": [
+      {
+        "severity": "high",
+        "category": "bug",
+        "file": "src/pricing.ts",
+        "line": 2,
+        "title": "Caller not updated for the new required parameter",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "division-by-zero": {
+    "name": "division-by-zero",
+    "findings": [
+      {
+        "severity": "high",
+        "category": "bug",
+        "file": "src/average.ts",
+        "line": 3,
+        "title": "Division by zero for an empty array",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "empty-catch": {
+    "name": "empty-catch",
+    "findings": [
+      {
+        "severity": "critical",
+        "category": "bug",
+        "file": "src/charge.js",
+        "line": 4,
+        "title": "Failed charge is swallowed and order still marked paid",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "missing-await": {
+    "name": "missing-await",
+    "findings": [
+      {
+        "severity": "high",
+        "category": "bug",
+        "file": "src/save-all.js",
+        "line": 3,
+        "title": "Async save is not awaited",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "null-deref": {
+    "name": "null-deref",
+    "findings": [
+      {
+        "severity": "high",
+        "category": "bug",
+        "file": "src/user.ts",
+        "line": 4,
+        "title": "Possible null dereference of user.name",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "off-by-one": {
+    "name": "off-by-one",
+    "findings": [
+      {
+        "severity": "high",
+        "category": "bug",
+        "file": "src/sum.ts",
+        "line": 3,
+        "title": "Off-by-one loop bound",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "parse-int-radix": {
+    "name": "parse-int-radix",
+    "findings": [
+      {
+        "severity": "high",
+        "category": "bug",
+        "file": "src/port.js",
+        "line": 2,
+        "title": "parseInt result is not validated",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "python-none-deref": {
+    "name": "python-none-deref",
+    "findings": [
+      {
+        "severity": "high",
+        "category": "bug",
+        "file": "src/store.py",
+        "line": 8,
+        "title": "AttributeError when the item is missing",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "regex-unanchored": {
+    "name": "regex-unanchored",
+    "findings": [
+      {
+        "severity": "high",
+        "category": "security",
+        "file": "src/validate.js",
+        "line": 2,
+        "title": "Validation regex is not anchored",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "resource-leak": {
+    "name": "resource-leak",
+    "findings": [
+      {
+        "severity": "high",
+        "category": "bug",
+        "file": "src/first-line.js",
+        "line": 4,
+        "title": "File handle is never closed",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "retry-zero-attempts": {
+    "name": "retry-zero-attempts",
+    "findings": [
+      {
+        "severity": "high",
+        "category": "bug",
+        "file": "src/retry.ts",
+        "line": 5,
+        "title": "attempts=0 now throws undefined",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "secret-in-code": {
+    "name": "secret-in-code",
+    "findings": [
+      {
+        "severity": "critical",
+        "category": "security",
+        "file": "src/config.ts",
+        "line": 3,
+        "title": "Hardcoded live API key committed to the repo",
+        "hasSuggestion": false
+      },
+      {
+        "severity": "critical",
+        "category": "secret",
+        "file": "src/config.ts",
+        "line": 3,
+        "title": "Possible hardcoded secret committed",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "shared-date-mutation": {
+    "name": "shared-date-mutation",
+    "findings": [
+      {
+        "severity": "high",
+        "category": "bug",
+        "file": "src/dates.js",
+        "line": 2,
+        "title": "Caller's Date object is mutated",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "slug-truncate-off-by-one": {
+    "name": "slug-truncate-off-by-one",
+    "findings": [
+      {
+        "severity": "high",
+        "category": "bug",
+        "file": "src/slugify.js",
+        "line": 12,
+        "title": "Boundary change truncates slugs that exactly fit",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "sql-injection": {
+    "name": "sql-injection",
+    "findings": [
+      {
+        "severity": "critical",
+        "category": "security",
+        "file": "src/db/find-user.js",
+        "line": 2,
+        "title": "SQL injection via string interpolation",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "verifier-drops-false-positive": {
+    "name": "verifier-drops-false-positive",
+    "findings": [
+      {
+        "severity": "high",
+        "category": "bug",
+        "file": "src/discount.ts",
+        "line": 5,
+        "title": "Percentage not divided by 100",
+        "hasSuggestion": false
+      }
+    ]
+  },
+  "wrong-operator": {
+    "name": "wrong-operator",
+    "findings": [
+      {
+        "severity": "high",
+        "category": "bug",
+        "file": "src/pricing.ts",
+        "line": 4,
+        "title": "Subtotal subtracts item prices",
+        "hasSuggestion": false
+      }
+    ]
+  }
+}

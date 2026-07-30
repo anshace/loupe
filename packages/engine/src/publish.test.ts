@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { AnchoredFinding } from "./clamp";
 import type { FetchLike } from "./diff";
-import { buildReviewPayload, formatFindingComment, postReview, renderSuggestionBlock } from "./publish";
+import type { CommentableMap } from "./clamp";
+import { buildReviewPayload, committableRange, formatFindingComment, postReview, renderSuggestionBlock } from "./publish";
 import type { Finding } from "./types";
 
 const inline: Finding = {
@@ -75,6 +76,60 @@ describe("renderSuggestionBlock (backtick-fence escalation)", () => {
   });
 });
 
+const rangeFinding: Finding = {
+  severity: "high",
+  category: "bug",
+  file: "src/app.ts",
+  line: 4, // END of the range
+  startLine: 2, // START of the range
+  title: "Broken conditional block",
+  body: "The 3-line guard is inverted.",
+  suggestedRange: "  if (!ok) {\n    return early;\n  }",
+  suggestion: "invert the guard",
+};
+
+describe("committableRange (feature #18)", () => {
+  const commentable: CommentableMap = { "src/app.ts": [2, 3, 4, 9] };
+
+  it("returns the start/end pair when the whole range is exact-commentable", () => {
+    expect(committableRange(rangeFinding, commentable)).toEqual({ start: 2, end: 4 });
+  });
+
+  it("returns undefined when a line inside the range is NOT commentable (a gap)", () => {
+    // 3 is missing → [2..4] is not contiguous on the RIGHT side.
+    expect(committableRange(rangeFinding, { "src/app.ts": [2, 4] })).toBeUndefined();
+  });
+
+  it("returns undefined when startLine is not strictly before line", () => {
+    expect(committableRange({ ...rangeFinding, startLine: 4 }, commentable)).toBeUndefined();
+    expect(committableRange({ ...rangeFinding, startLine: 5 }, commentable)).toBeUndefined();
+  });
+
+  it("returns undefined without a suggestedRange, a startLine, or a numeric line", () => {
+    expect(committableRange({ ...rangeFinding, suggestedRange: undefined }, commentable)).toBeUndefined();
+    expect(committableRange({ ...rangeFinding, startLine: undefined }, commentable)).toBeUndefined();
+    expect(committableRange({ ...rangeFinding, line: undefined }, commentable)).toBeUndefined();
+  });
+
+  it("returns undefined when the file has no commentable lines", () => {
+    expect(committableRange(rangeFinding, {})).toBeUndefined();
+    expect(committableRange(rangeFinding, { "src/app.ts": [] })).toBeUndefined();
+  });
+});
+
+describe("formatFindingComment — multi-line range mode (feature #18)", () => {
+  it('renders the suggestedRange as a ```suggestion block in "range" mode', () => {
+    const text = formatFindingComment(rangeFinding, "range");
+    expect(text).toContain("**Suggested fix:**\n```suggestion\n  if (!ok) {\n    return early;\n  }\n```");
+  });
+
+  it('falls back to prose in "range" mode when suggestedRange is absent', () => {
+    const text = formatFindingComment({ ...rangeFinding, suggestedRange: undefined }, "range");
+    expect(text).not.toContain("```suggestion");
+    expect(text).toContain("**Suggested fix:**\ninvert the guard");
+  });
+});
+
 describe("buildReviewPayload", () => {
   it("builds ONE COMMENT review with only line-anchored findings as inline comments", () => {
     const payload = buildReviewPayload("summary text", [at(inline, "line"), at(fileLevel, "file")]);
@@ -108,6 +163,50 @@ describe("buildReviewPayload", () => {
     const payload = buildReviewPayload("✅ no issues found", []);
     expect(payload.comments).toEqual([]);
     expect(payload.body).toBe("✅ no issues found");
+  });
+
+  // ── Multi-line range suggestions (feature #18) ──────────────────────────────
+  const commentable: CommentableMap = { "src/app.ts": [2, 3, 4, 9] };
+
+  it("emits a multi-line range comment (start_line/start_side) for a validated range", () => {
+    const payload = buildReviewPayload("s", [at(rangeFinding, "line")], commentable);
+    expect(payload.comments).toHaveLength(1);
+    expect(payload.comments[0]).toMatchObject({
+      path: "src/app.ts",
+      startLine: 2,
+      startSide: "RIGHT",
+      line: 4,
+      side: "RIGHT",
+    });
+    expect(payload.comments[0].body).toContain("```suggestion\n  if (!ok) {\n    return early;\n  }\n```");
+  });
+
+  it("falls back to a single-line suggestion when the range has a gap (not contiguous)", () => {
+    const f: Finding = { ...rangeFinding, suggestedLine: "  return a + b;" };
+    const payload = buildReviewPayload("s", [at(f, "line")], { "src/app.ts": [2, 4] });
+    expect(payload.comments[0].startLine).toBeUndefined(); // no range emitted
+    expect(payload.comments[0].line).toBe(4);
+    expect(payload.comments[0].body).toContain("```suggestion\n  return a + b;\n```"); // single-line block
+  });
+
+  it("falls back to PROSE when the range is invalid and there is no suggestedLine", () => {
+    const payload = buildReviewPayload("s", [at(rangeFinding, "line")], { "src/app.ts": [2, 4] });
+    expect(payload.comments[0].startLine).toBeUndefined();
+    expect(payload.comments[0].body).not.toContain("```suggestion");
+    expect(payload.comments[0].body).toContain("**Suggested fix:**\ninvert the guard");
+  });
+
+  it("never emits a range for a clamped 'nearest' anchor even if the range would validate", () => {
+    const payload = buildReviewPayload("s", [at(rangeFinding, "nearest")], commentable);
+    expect(payload.comments[0].startLine).toBeUndefined();
+    expect(payload.comments[0].body).not.toContain("```suggestion");
+    expect(payload.comments[0].body).toContain("**Suggested fix:**\ninvert the guard"); // prose fallback
+  });
+
+  it("does not emit a range when no commentable map is passed (back-compat default)", () => {
+    const payload = buildReviewPayload("s", [at(rangeFinding, "line")]);
+    expect(payload.comments[0].startLine).toBeUndefined();
+    expect(payload.comments[0].body).toContain("**Suggested fix:**\ninvert the guard");
   });
 });
 

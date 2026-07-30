@@ -14,6 +14,12 @@ import type { FetchLike } from "./diff";
 export interface ModelRequest {
   system: string;
   user: string;
+  /**
+   * Optional per-call sampling temperature. When set it overrides the
+   * provider's own default — used by self-consistency voting (report item #15)
+   * to draw independent samples at temperature > 0. Omitted → provider default.
+   */
+  temperature?: number;
 }
 
 export interface ModelResponse {
@@ -69,7 +75,7 @@ export class GeminiFlashProvider implements ReviewModel {
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: req.system }] },
         contents: [{ role: "user", parts: [{ text: req.user }] }],
-        generationConfig: { temperature: 0.2, responseMimeType: "application/json" },
+        generationConfig: { temperature: req.temperature ?? 0.2, responseMimeType: "application/json" },
       }),
     });
     if (!res.ok) {
@@ -133,6 +139,7 @@ export class AnthropicProvider implements ReviewModel {
       body: JSON.stringify({
         model: this.name,
         max_tokens: this.opts.maxTokens ?? 8192,
+        ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
         system: [
           { type: "text", text: req.system, cache_control: { type: "ephemeral" } },
         ],
@@ -241,7 +248,7 @@ export class OpenAICompatibleProvider implements ReviewModel {
     const body: Record<string, unknown> = {
       model: this.name,
       max_tokens: this.opts.maxTokens ?? 8192,
-      temperature: this.opts.temperature ?? 0.2,
+      temperature: req.temperature ?? this.opts.temperature ?? 0.2,
       messages: [
         { role: "system", content: req.system },
         { role: "user", content: req.user },

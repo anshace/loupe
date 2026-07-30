@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseModelFindings, parseToolCalls } from "./guardrail";
+import { parseModelFindings, parseToolCalls, parseWalkthrough } from "./guardrail";
 
 const VALID = {
   severity: "high",
@@ -191,6 +191,80 @@ describe("parseModelFindings — committable suggestedLine (feature #7)", () => 
 
   it("is undefined when the model emits no committable line", () => {
     expect(parseModelFindings(JSON.stringify([VALID])).findings[0].suggestedLine).toBeUndefined();
+  });
+});
+
+describe("parseModelFindings — multi-line suggestedRange + startLine (feature #18)", () => {
+  it("carries a multi-line suggestedRange and startLine, preserving indentation", () => {
+    const res = parseModelFindings(
+      JSON.stringify([{ ...VALID, startLine: 2, suggestedRange: "  if (!ok) {\n    return;\n  }" }]),
+    );
+    expect(res.findings[0].startLine).toBe(2);
+    expect(res.findings[0].suggestedRange).toBe("  if (!ok) {\n    return;\n  }");
+  });
+
+  it("accepts snake_case / synonym spellings for both fields", () => {
+    const res = parseModelFindings(
+      JSON.stringify([{ ...VALID, range_start: 2, replacement_lines: "a;\nb;" }]),
+    );
+    expect(res.findings[0].startLine).toBe(2);
+    expect(res.findings[0].suggestedRange).toBe("a;\nb;");
+    const res2 = parseModelFindings(JSON.stringify([{ ...VALID, fromLine: "3", suggestedLines: "x;\ny;" }]));
+    expect(res2.findings[0].startLine).toBe(3);
+    expect(res2.findings[0].suggestedRange).toBe("x;\ny;");
+  });
+
+  it("rejects a SINGLE-line suggestedRange — that is the suggestedLine case, not a range", () => {
+    const res = parseModelFindings(JSON.stringify([{ ...VALID, startLine: 2, suggestedRange: "just one line" }]));
+    expect(res.findings[0].suggestedRange).toBeUndefined();
+  });
+
+  it("strips only trailing newlines from a multi-line range", () => {
+    const res = parseModelFindings(JSON.stringify([{ ...VALID, suggestedRange: "a;\nb;\n\n" }]));
+    expect(res.findings[0].suggestedRange).toBe("a;\nb;");
+  });
+
+  it("does NOT read start_line as startLine (that key already feeds the END line)", () => {
+    // A finding that supplies only `start_line` uses it as the finding's `line`
+    // (via coerceLine); startLine stays undefined so it can never form a range.
+    const res = parseModelFindings(JSON.stringify([{ ...VALID, line: undefined, start_line: 7 }]));
+    expect(res.findings[0].line).toBe(7);
+    expect(res.findings[0].startLine).toBeUndefined();
+  });
+
+  it("ignores non-positive-integer startLine values", () => {
+    const res = parseModelFindings(
+      JSON.stringify([{ ...VALID, startLine: -1, suggestedRange: "a;\nb;" }]),
+    );
+    expect(res.findings[0].startLine).toBeUndefined();
+  });
+
+  it("leaves both fields undefined for an ordinary finding", () => {
+    const res = parseModelFindings(JSON.stringify([VALID]));
+    expect(res.findings[0].startLine).toBeUndefined();
+    expect(res.findings[0].suggestedRange).toBeUndefined();
+  });
+});
+
+describe("parseWalkthrough (report item #26)", () => {
+  it("extracts the walkthrough field from an object-wrapped response", () => {
+    const raw = JSON.stringify({ walkthrough: "Adds pricing guardrails.", findings: [VALID] });
+    expect(parseWalkthrough(raw)).toBe("Adds pricing guardrails.");
+    // The findings array is still readable by the normal parser.
+    expect(parseModelFindings(raw).findings).toHaveLength(1);
+  });
+
+  it("tolerates fences and the `effort` / `overview` synonyms", () => {
+    expect(parseWalkthrough('```json\n{"effort": "small, low risk", "findings": []}\n```')).toBe("small, low risk");
+    expect(parseWalkthrough('{"overview": "refactor only", "findings": []}')).toBe("refactor only");
+  });
+
+  it("returns undefined for a bare array, missing field, or empty value", () => {
+    expect(parseWalkthrough("[]")).toBeUndefined();
+    expect(parseWalkthrough(JSON.stringify([VALID]))).toBeUndefined();
+    expect(parseWalkthrough(JSON.stringify({ walkthrough: "   ", findings: [] }))).toBeUndefined();
+    expect(parseWalkthrough("not json at all")).toBeUndefined();
+    expect(parseWalkthrough("")).toBeUndefined();
   });
 });
 

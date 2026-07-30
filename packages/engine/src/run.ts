@@ -41,7 +41,7 @@ import type { ExistingComments } from "./dedupe";
 import { dedupeFindings, fetchExistingComments, groupNearDuplicates } from "./dedupe";
 import type { FetchLike } from "./diff";
 import { fetchPrDiff, parseUnifiedDiff } from "./diff";
-import { ESCALATION_MODEL, riskyPaths, shouldEscalate } from "./escalate";
+import { ESCALATION_MODEL, computeEscalation, riskyPaths } from "./escalate";
 import { shouldRun } from "./gate";
 import { decideScope, dropReviewedHunks, fetchCompareDiff } from "./incremental";
 import type { Retriever } from "./retrieve";
@@ -57,7 +57,7 @@ import {
   mergeFindings,
   prStateKey,
 } from "./state";
-import { parseModelFindings, parseToolCalls } from "./guardrail";
+import { parseModelFindings, parseToolCalls, parseWalkthrough } from "./guardrail";
 import type { ProviderChoice, ReviewModel } from "./model";
 import {
   FREE_TIER_PROVIDER,
@@ -67,20 +67,45 @@ import {
   selectProvider,
 } from "./model";
 import { filterNoise } from "./noise";
-import { DEFAULT_IMPORT_SCAN_CAPS, collectSignatureChangeCallers } from "./importgraph";
+import {
+  DEFAULT_IMPORT_SCAN_CAPS,
+  collectSignatureChangeCallers,
+  countImporters,
+  scanRepoImports,
+} from "./importgraph";
 import { scanSecrets } from "./secrets";
 import { checkWorkflows } from "./workflowcheck";
+import { auditDependencies, scanDependencyChanges } from "./deps";
+import { renderSinkEvidence, scanSinks } from "./sinkpack";
 import { fetchPrIntent, renderPrIntent } from "./intent";
-import { buildSecurityChecklist, formatCommentableLines, loadPromptTemplate, renderPrompt } from "./prompt";
+import { discoverRelatedTests, extractChangedSymbols, renderRelatedTests } from "./relatedtests";
+import { collectChurnyPaths, collectFileHistories, renderHistoryContext } from "./history";
+import type { CiIo } from "./ci";
+import { filterToTouched, loadCiDiagnostics, renderCiGroundTruth } from "./ci";
+import {
+  buildFewShotExemplars,
+  buildSecurityChecklist,
+  formatCommentableLines,
+  loadPromptTemplate,
+  renderPrompt,
+  sanitizeUntrusted,
+  selectReviewerPrompt,
+} from "./prompt";
+import {
+  SELF_CONSISTENCY_MAX_SAMPLES,
+  SELF_CONSISTENCY_TEMPERATURE,
+  isHighStakes,
+  reconcileSelfConsistency,
+} from "./selfconsistency";
 import type { ScopeExpander } from "./scope";
 import { RegexScopeExpander, buildContext } from "./scope";
 import type { ScopeInput } from "./scope";
 import {
-  VERIFIER_PROMPT_FILE,
   applyVerdicts,
   buildGroundingSource,
   formatFindingsForVerifier,
   parseVerifierOutput,
+  selectVerifierPrompt,
 } from "./verify";
 import { buildReviewPayload, formatFileLevelSections, postReview } from "./publish";
 import { composeSummaryComment, findSummaryComment, upsertSummaryComment } from "./summary";
@@ -152,6 +177,8 @@ export interface RunDeps {
   stateStore?: StateStore;
   /** Run-log file IO overrides (tests). */
   runLogIo?: RunLogIo;
+  /** CI/lint/tsc output file IO overrides (feature #16 ingestion; tests). */
+  ciIo?: CiIo;
   /** Retrieval implementation for the RAG experiment (task 7.6, packages/rag). */
   retriever?: Retriever;
   /**
@@ -161,6 +188,20 @@ export interface RunDeps {
    */
   prIntent?: PrIntent;
 }
+
+/**
+ * Walkthrough instruction (report item #26) injected into the reviewer-v8
+ * {{WALKTHROUGH_INSTRUCTION}} placeholder. When on, the reviewer wraps its
+ * output as an object with a sibling `walkthrough` field (the guardrail already
+ * reads the findings array out of that wrapper). When off, it must stay on the
+ * bare findings-array contract.
+ */
+const WALKTHROUGH_INSTRUCTION_ON =
+  "Also provide a brief high-level walkthrough of this PR. To do so, wrap your " +
+  'output as a JSON object: {"walkthrough": "<2–4 sentence plain-language ' +
+  'overview of what this change does and where the risk is>", "findings": [ ...the findings array... ]}. ' +
+  "The walkthrough is prose (not a finding) and never a substitute for a finding.";
+const WALKTHROUGH_INSTRUCTION_OFF = "(not requested — respond with the bare findings array as specified above)";
 
 export interface SummaryParts {
   findings: Finding[];
@@ -380,8 +421,48 @@ export async function runReview(
   let model = deps.model;
   if (!model) {
     const overBudget = isOverMonthlyBudget(env, config.ledgerPath, now(), deps.ledgerIo);
-    // Risky paths (auth/payment/billing/migration/crypto/secret) escalate.
-    const risky = (config.escalation ?? true) && shouldEscalate(kept.map((f) => f.path));
+
+    // ── Escalation signals (6.5 + report item #19): the risky-PATH heuristic
+    // (default on), OR-ed with two opt-in deterministic signals — blast radius
+    // (a changed file imported by many others, from the import-graph substrate)
+    // and churn (a changed file with recent revert/hotfix history). The two
+    // extra signals cost a repo scan + per-file history calls, so they only run
+    // when `blastRadiusEscalation` is on (free-tier-first); both are fail-soft.
+    const keptPaths = kept.map((f) => f.path);
+    let importerCounts: Map<string, number> | undefined;
+    let churnyPaths: string[] | undefined;
+    if ((config.blastRadiusEscalation ?? false) && keptPaths.length > 0) {
+      const reader = deps.repoReader ?? githubRepoReader(pr, auth, config.event?.headSha, fetchImpl);
+      try {
+        const scan = await scanRepoImports(
+          reader,
+          { ...DEFAULT_IMPORT_SCAN_CAPS, ...config.crossFileCaps },
+          newAgenticUsage(),
+        );
+        importerCounts = countImporters(scan, keptPaths);
+      } catch {
+        // blast-radius scan is best-effort — fall back to the path signal alone
+      }
+      try {
+        churnyPaths = await collectChurnyPaths(
+          pr,
+          auth,
+          config.event?.headSha ?? "HEAD",
+          keptPaths,
+          fetchImpl,
+        );
+      } catch {
+        // churn history is best-effort — fall back to the path signal alone
+      }
+    }
+    const escalation = computeEscalation({
+      paths: keptPaths,
+      importerCounts,
+      blastRadiusThreshold: config.blastRadiusThreshold,
+      churnyPaths,
+    });
+    const risky = (config.escalation ?? true) && escalation.escalate;
+    const escalationWhy = escalation.reasons.join("; ");
 
     if (config.provider) {
       // ── Unified provider scheme: provider = the wire protocol.
@@ -403,7 +484,7 @@ export async function runReview(
         if (target) {
           model = buildProvider({ ...base, model: target });
           escalated = true;
-          notices.push(`risky paths in this diff — review escalated to ${target}`);
+          notices.push(`review escalated to ${target} (${escalationWhy})`);
         } else {
           model = buildProvider(base);
         }
@@ -424,7 +505,7 @@ export async function runReview(
         // Rebuild the shortcut's provider with the stronger model.
         model = buildProvider({ ...providerChoiceConfig(choice), model: target, fetchImpl, env });
         escalated = true;
-        notices.push(`risky paths in this diff — review escalated to ${target}`);
+        notices.push(`review escalated to ${target} (${escalationWhy})`);
       } else {
         model = selectProvider(choice, fetchImpl);
       }
@@ -438,6 +519,7 @@ export async function runReview(
   let usage: ReviewResult["usage"];
   let verification: ReviewResult["verification"];
   let agenticUsage: ReviewResult["agenticUsage"];
+  let walkthrough: string | undefined;
   const nothingReviewable = kept.length === 0;
 
   if (!nothingReviewable) {
@@ -493,10 +575,103 @@ export async function runReview(
       }
     }
 
+    // ── Related-tests discovery (report item #17): deterministic sibling-test
+    // lookup against the repo tree. Default ON — it is "(none)"-safe (no matches
+    // → no prompt noise) and fail-soft. Reviewer-only context ({{RELATED_TESTS}}).
+    let relatedTestsText = "(none)";
+    if (config.relatedTests ?? true) {
+      const reader = deps.repoReader ?? githubRepoReader(pr, auth, config.event?.headSha, fetchImpl);
+      const testInputs = kept
+        .filter((f) => !f.isBinary && f.status !== "deleted")
+        .map((f) => ({
+          path: f.path,
+          symbols: extractChangedSymbols(
+            f.hunks.flatMap((h) => h.lines.filter((l) => l.type === "add").map((l) => l.content)),
+          ),
+        }));
+      try {
+        relatedTestsText = renderRelatedTests(await discoverRelatedTests(testInputs, reader));
+      } catch {
+        notices.push("related-tests discovery failed — continuing without it");
+      }
+    }
+
+    // ── Git blame / history context (report item #20): one GraphQL blame call
+    // per changed file → "last touched N days ago by M author(s)". Default OFF
+    // (extra API calls, like crossFileCallers/rag); fail-soft. `now` comes from
+    // the injected clock so the pure pipeline stays deterministic. Feeds the
+    // reviewer {{CODE_HISTORY}} block AND the verifier ground-truth context
+    // (real evidence for the verifier's `pre-existing` drop reason).
+    let historyText = "(none)";
+    if (config.historyContext ?? false) {
+      const historyInputs = kept
+        .filter((f) => !f.isBinary && f.status !== "deleted" && f.hunks.length > 0)
+        .map((f) => ({
+          path: f.path,
+          spans: f.hunks.map((h) => ({
+            startLine: h.newStart,
+            endLine: h.newStart + Math.max(h.newLines - 1, 0),
+          })),
+        }));
+      try {
+        const histories = await collectFileHistories(
+          pr,
+          auth,
+          config.event?.headSha ?? "HEAD",
+          historyInputs,
+          fetchImpl,
+          now(),
+        );
+        historyText = renderHistoryContext(histories);
+      } catch {
+        notices.push("history/blame context failed — continuing without it");
+      }
+    }
+
+    // ── CI/lint/tsc output ingestion (report item #16): parse the repo's
+    // EXISTING static-analysis output at an operator-provided local path, filter
+    // to the touched files, and render it as CITED deterministic ground truth
+    // the verifier can cross-reference. Path set by the TRUSTED operator (never
+    // the attacker-controllable .aireview.toml); fail-soft when absent/unreadable.
+    // Scoped to the verifier, so only loaded when the verifier will consume it.
+    let ciGroundTruth = "(none)";
+    if (config.ciOutputPath && (config.verify ?? false)) {
+      const diags = filterToTouched(
+        loadCiDiagnostics(config.ciOutputPath, config.ciOutputFormat, deps.ciIo),
+        kept.map((f) => f.path),
+      );
+      ciGroundTruth = renderCiGroundTruth(diags);
+      if (diags.length > 0) {
+        notices.push(
+          `ingested ${diags.length} CI/lint diagnostic(s) for the touched files as verifier ground truth`,
+        );
+      }
+    }
+
+    // ── Dangerous-sink rule pack (report item #21): a deterministic per-language
+    // pattern scan over the ADDED lines, injected as PRE-FLAGGED evidence the
+    // reviewer must reason about — source→sink reachability required before a
+    // high/critical (see reviewer-v11). Default OFF (uncertain precision lever,
+    // pending live-eval measurement). The matched lines ARE diff lines, so they
+    // ground against the diff; included in the grounding context for consistency.
+    let sinkText = "(none)";
+    const sinkOn = config.sinkPack ?? false;
+    if (sinkOn) {
+      const matches = scanSinks(kept);
+      sinkText = renderSinkEvidence(matches);
+      if (matches.length > 0) {
+        notices.push(`dangerous-sink pack: pre-flagged ${matches.length} sink(s) for taint reasoning`);
+      }
+    }
+
     // ── Grounding source (feature #1): the exact diff-line contents + context
-    // text sent to the model, for the verifier's deterministic quote check.
-    // The injected call sites are part of what the reviewer saw, so include them
-    // so the verifier can ground a caller-mismatch quote.
+    // text sent to the model, for the verifier's deterministic quote check. The
+    // injected call sites, blame history, CI ground truth, and sink evidence are
+    // all part of what the verifier is shown, so include them so those quotes
+    // ground too.
+    const groundingContext = [context.text, crossFileText, historyText, ciGroundTruth, sinkText]
+      .filter((t) => t && t !== "(none)")
+      .join("\n\n");
     const groundingSource = buildGroundingSource(
       kept.map((f) => ({
         path: f.path,
@@ -506,7 +681,7 @@ export async function runReview(
             .map((l) => ({ line: l.newLine as number, content: l.content })),
         ),
       })),
-      crossFileText === "(none)" ? context.text : `${context.text}\n\n${crossFileText}`,
+      groundingContext,
     );
 
     // ── PR intent (feature #3): title/body + linked issues, one REST call,
@@ -550,20 +725,65 @@ export async function runReview(
       }
     }
 
+    // ── Prompt-injection self-defense (report item #23): the diff, house rules,
+    // custom rules, and PR intent are all attacker-reachable text templated into
+    // the prompt. Strip zero-width/bidi Unicode from all of them and NEUTRALIZE
+    // injection-marker phrases inline in the instruction-like blocks (house/custom
+    // rules, PR intent); the diff is left visually verbatim (grounding depends on
+    // it) — its defense is the invisible-char strip + a surfaced notice. Default
+    // ON — it protects Loupe itself. A single aggregated notice per source.
+    const injectionOn = config.injectionDefense ?? true;
+    const sanitize = (label: string, text: string, defang: boolean): string => {
+      if (!injectionOn || !text || text === "(none)") return text;
+      const s = sanitizeUntrusted(text, { defang });
+      if (s.markers.length > 0 || s.strippedChars > 0) {
+        const strip = s.strippedChars > 0 ? `, ${s.strippedChars} hidden char(s) stripped` : "";
+        notices.push(
+          `⚠ possible prompt-injection content ${defang ? "neutralized" : "detected"} in ${label} ` +
+            `(${s.markers.length} marker(s)${strip})`,
+        );
+      }
+      return s.text;
+    };
+    const houseRulesText = houseRules?.trim()
+      ? sanitize("HOUSE_RULES.md", houseRules.trim(), true)
+      : "(none)";
+    const customRulesSafe = sanitize(".aireview.toml custom rules", customRulesText, true);
+    const prIntentSafe = sanitize("the PR description", prIntentText, true);
+    const diffForModel = sanitize("the diff", diffText2, false);
+
     if (!tracker.canProceed()) {
       earlyStop = true;
     } else {
-      const template = deps.promptTemplate ?? loadPromptTemplate(config.promptPath);
+      // ── Reviewer prompt selection (report items #14, #26, #21): the flagged
+      // reviewer-v11 (with the exemplar/walkthrough/sink placeholders) only when a
+      // flag needs it, else the v9 default. All placeholder vars are always
+      // passed; v9 has no such tokens so they are simply ignored there
+      // (renderPrompt no-ops on absent tokens).
+      const fewShotOn = config.fewShotExemplars ?? false;
+      const walkthroughOn = config.walkthrough ?? false;
+      const reviewerFile = selectReviewerPrompt({
+        fewShotExemplars: fewShotOn,
+        walkthrough: walkthroughOn,
+        sinkPack: sinkOn,
+      });
+      const template =
+        deps.promptTemplate ?? loadPromptTemplate(config.promptPath, reviewerFile);
       const rendered = renderPrompt(template, {
-        DIFF: diffText2,
+        DIFF: diffForModel,
         COMMENTABLE_LINES: formatCommentableLines(kept),
-        HOUSE_RULES: houseRules?.trim() ? houseRules.trim() : "(none)",
-        CUSTOM_RULES: customRulesText,
+        HOUSE_RULES: houseRulesText,
+        CUSTOM_RULES: customRulesSafe,
         CONTEXT: contextText,
+        RELATED_TESTS: relatedTestsText,
+        CODE_HISTORY: historyText,
         RETRIEVED_CONTEXT: retrievedText,
-        PR_INTENT: prIntentText,
+        PR_INTENT: prIntentSafe,
         SECURITY_CHECKLIST: securityChecklist,
         CROSS_FILE_CALLERS: crossFileText,
+        SINK_EVIDENCE: sinkText,
+        FEWSHOT_EXEMPLARS: buildFewShotExemplars(fewShotOn),
+        WALKTHROUGH_INSTRUCTION: walkthroughOn ? WALKTHROUGH_INSTRUCTION_ON : WALKTHROUGH_INSTRUCTION_OFF,
         TOOLS: toolsText,
       });
 
@@ -580,6 +800,45 @@ export async function runReview(
         const guard = parseModelFindings(loop.response.text);
         degraded = guard.degraded;
         rawFindings = guard.findings;
+        // ── Walkthrough narrative (report item #26): optional sibling field on
+        // the reviewer JSON; fail open (absent → undefined). Off by default.
+        if (walkthroughOn && !degraded) {
+          walkthrough = parseWalkthrough(loop.response.text);
+        }
+      }
+
+      // ── Self-consistency voting (report item #15): on critical/high findings,
+      // re-run the reviewer 1–2× at temperature > 0 and DEMOTE (never drop) any
+      // high-stakes finding a majority of samples do not reproduce. Bounded to
+      // the per-run cost cap; off by default (uncertain precision lever).
+      if ((config.selfConsistency ?? false) && !degraded && rawFindings.some((f) => isHighStakes(f.severity))) {
+        const samples: Finding[][] = [];
+        for (let i = 0; i < SELF_CONSISTENCY_MAX_SAMPLES; i += 1) {
+          if (!tracker.canProceed()) {
+            notices.push("self-consistency: cost cap reached — used fewer samples");
+            earlyStop = true;
+            break;
+          }
+          const resample = await model.complete({
+            system: rendered.system,
+            user: rendered.user,
+            temperature: SELF_CONSISTENCY_TEMPERATURE,
+          });
+          tracker.record(model.name, resample.inputTokens, resample.outputTokens);
+          const g = parseModelFindings(resample.text);
+          if (!g.degraded) samples.push(g.findings);
+        }
+        if (samples.length === 0) {
+          notices.push("self-consistency: no usable extra samples — severities unchanged");
+        } else {
+          const reconciled = reconcileSelfConsistency(rawFindings, samples);
+          rawFindings = reconciled.findings;
+          if (reconciled.demoted.length > 0) {
+            notices.push(
+              `self-consistency: demoted ${reconciled.demoted.length} high-stakes finding(s) not reproduced across ${samples.length + 1} samples`,
+            );
+          }
+        }
       }
 
       // ── Verifier pass (6.4): keep/rewrite/drop with evidence; fail OPEN.
@@ -590,11 +849,27 @@ export async function runReview(
           earlyStop = true;
         } else {
           const verifierTemplate =
-            deps.verifierTemplate ?? loadPromptTemplate(undefined, VERIFIER_PROMPT_FILE);
+            deps.verifierTemplate ??
+            loadPromptTemplate(undefined, selectVerifierPrompt(config.chainOfVerification));
+          // The verifier gets the same enclosing-scope context PLUS the blame
+          // history and CI/lint ground truth (features #20, #16) folded in as
+          // labeled sections — deterministic evidence it can cite (esp. for the
+          // `pre-existing` drop reason). Grounded against `groundingSource`,
+          // which already includes those sections.
+          const verifierContext =
+            [
+              contextText === "(none)" ? "" : contextText,
+              historyText === "(none)" ? "" : `## Code history (blame)\n${historyText}`,
+              ciGroundTruth === "(none)"
+                ? ""
+                : `## Static-analysis findings (CITED ground truth from CI/lint/tsc)\n${ciGroundTruth}`,
+            ]
+              .filter((t) => t.trim().length > 0)
+              .join("\n\n") || "(none)";
           const verifierRendered = renderPrompt(verifierTemplate, {
             FINDINGS: formatFindingsForVerifier(rawFindings),
-            DIFF: diffText2,
-            CONTEXT: contextText,
+            DIFF: diffForModel,
+            CONTEXT: verifierContext,
             TOOLS: toolsText,
           });
           const verifierLoop = await agenticComplete(model, verifierRendered, tracker, agenticOpts);
@@ -630,19 +905,38 @@ export async function runReview(
     if (agenticOpts) agenticUsage = agenticOpts.usage;
   }
 
-  // ── Deterministic security pre-passes (features #2, #4): secret/credential
-  // scan + GitHub Actions workflow supply-chain checks over ADDED diff lines
-  // only. Both skip the LLM/verifier entirely and merge straight into the
-  // normal publish path, so anchoring, dedupe, and suppression still apply.
-  // Merged AFTER the model/verifier block so a leaked key or unpinned action is
-  // still flagged even when the model call failed (degraded) or stopped early.
+  // ── Deterministic security pre-passes (features #2, #4, #22): secret scan +
+  // GitHub Actions workflow supply-chain checks + dependency review (new-dep +
+  // install-script heads-up) over ADDED diff lines only. All skip the LLM/
+  // verifier and merge straight into the normal publish path, so anchoring,
+  // dedupe, and suppression still apply. Merged AFTER the model/verifier block so
+  // a leaked key / unpinned action / risky new dep is still flagged even when the
+  // model call failed (degraded) or stopped early.
+  // Dependency scan runs over `afterIgnore` (respects ignore globs) rather than
+  // `kept`, because lockfiles — where `hasInstallScript` lives — are noise-
+  // filtered out of `kept`. A lockfile finding lands file-level (lockfiles have
+  // no commentable lines), which is the right place for a generated file anyway.
+  const depScan =
+    (config.dependencyReview ?? true) ? scanDependencyChanges(afterIgnore) : { findings: [], newDeps: [] };
   const deterministic: Finding[] = [
     ...scanSecrets(kept, {
       allowPaths: repoConfig.secretAllowPaths,
       allowPatterns: repoConfig.secretAllowPatterns,
     }),
     ...checkWorkflows(kept),
+    ...depScan.findings,
   ];
+  // Optional network audit (feature #22): OSV.dev CVEs + npm license on the new
+  // deps. Off by default; only runs when there are new deps to audit. Fail-soft.
+  if ((config.dependencyAudit ?? false) && depScan.newDeps.length > 0) {
+    try {
+      const audit = await auditDependencies(depScan.newDeps, fetchImpl);
+      deterministic.push(...audit.findings);
+      notices.push(...audit.notices);
+    } catch {
+      notices.push("dependency audit failed — continuing with the deterministic dependency scan only");
+    }
+  }
   if (deterministic.length > 0) rawFindings = [...rawFindings, ...deterministic];
 
   // ── Suppression (4.1, 4.7, 4.9): do-not-report + house rules + min severity.
@@ -715,7 +1009,10 @@ export async function runReview(
     degraded,
     nothingReviewable,
   });
-  const payload = buildReviewPayload(reviewBody, publishableAnchored);
+  // Pass the commentable map so an exact-anchored finding carrying a validated
+  // contiguous `suggestedRange` renders as a multi-line ```suggestion (#18);
+  // publish falls back to single-line / prose when the range isn't clean.
+  const payload = buildReviewPayload(reviewBody, publishableAnchored, commentable);
 
   // ── One upserted summary comment with hidden marker + state SHA (4.4/4.5).
   // Feature #9: severity-grouped table (#9a), deterministic risk verdict (#9b,
@@ -735,6 +1032,7 @@ export async function runReview(
         0,
       ),
     },
+    walkthrough,
     degraded,
     nothingReviewable,
     summaryFindings,
@@ -832,5 +1130,6 @@ export async function runReview(
     summaryComment,
     verification,
     agenticUsage,
+    walkthrough,
   };
 }

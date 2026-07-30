@@ -634,6 +634,227 @@ describe("runReview — cost caps (4.11)", () => {
   });
 });
 
+/** A model that returns a scripted response per successive call. */
+class ScriptedModel {
+  readonly name = "mock";
+  readonly requests: Array<{ system: string; user: string; temperature?: number }> = [];
+  private i = 0;
+  constructor(private readonly scripts: string[]) {}
+  async complete(req: { system: string; user: string; temperature?: number }) {
+    this.requests.push(req);
+    const text = this.scripts[Math.min(this.i, this.scripts.length - 1)];
+    this.i += 1;
+    return { text, inputTokens: 10, outputTokens: 5 };
+  }
+}
+
+const CRIT_FINDING = JSON.stringify([
+  { severity: "critical", category: "security", file: "src/app.ts", line: 4, title: "Auth bypass", body: "b" },
+]);
+
+describe("runReview — Tier 2 precision flags (reports #13–#15, #26)", () => {
+  it("all four flags default OFF: v7 reviewer, bare array, no walkthrough/demotion", async () => {
+    const { deps } = capture();
+    const model = new MockProvider(CRIT_FINDING, { inputTokens: 10, outputTokens: 5 });
+    const result = await run(
+      { event: { headSha: "abc" } },
+      { ...deps, fetchImpl: diffFetch(MODIFIED_FILE_DIFF), model },
+    );
+    expect(result.findings[0].severity).toBe("critical"); // not demoted
+    expect(result.walkthrough).toBeUndefined();
+    expect(model.requests).toHaveLength(1); // no resampling
+    // Default reviewer prompt (v7) has no few-shot examples section.
+    expect(model.requests[0].user).not.toContain("true positive");
+  });
+
+  it("#14 few-shot: injects exemplars into the reviewer prompt", async () => {
+    const { deps } = capture();
+    const model = new MockProvider("[]");
+    await run(
+      { fewShotExemplars: true, event: { headSha: "abc" } },
+      { ...deps, fetchImpl: diffFetch(MODIFIED_FILE_DIFF), model },
+    );
+    expect(model.requests[0].user).toContain("true positive");
+    expect(model.requests[0].user).toContain("false positive");
+  });
+
+  it("#26 walkthrough: parses the sibling field and renders it in the summary", async () => {
+    const { upserts, deps } = capture();
+    const model = new MockProvider(
+      JSON.stringify({
+        walkthrough: "Refactors add() and exports VERSION.",
+        findings: [{ severity: "low", category: "bug", file: "src/app.ts", line: 4, title: "t", body: "b" }],
+      }),
+    );
+    const result = await run(
+      { walkthrough: true, event: { headSha: "abc" } },
+      { ...deps, fetchImpl: diffFetch(MODIFIED_FILE_DIFF), model },
+    );
+    expect(model.requests[0].system).toContain("walkthrough");
+    expect(result.walkthrough).toBe("Refactors add() and exports VERSION.");
+    expect(upserts[0].body).toContain("Refactors add() and exports VERSION.");
+  });
+
+  it("#15 self-consistency: demotes a critical finding no resample reproduces", async () => {
+    const { deps } = capture();
+    // Original pass + 2 resamples: resamples find nothing → critical → high.
+    const model = new ScriptedModel([CRIT_FINDING, "[]", "[]"]);
+    const result = await run(
+      { selfConsistency: true, event: { headSha: "abc" } },
+      { ...deps, fetchImpl: diffFetch(MODIFIED_FILE_DIFF), model: model as unknown as MockProvider },
+    );
+    expect(model.requests).toHaveLength(3); // 1 + 2 resamples
+    expect(model.requests[1].temperature).toBeGreaterThan(0); // resamples at temp>0
+    expect(result.findings[0].severity).toBe("high"); // demoted, not dropped
+    expect(result.notices.some((n) => n.includes("self-consistency: demoted"))).toBe(true);
+  });
+
+  it("#15 self-consistency: keeps a finding the resamples reproduce", async () => {
+    const { deps } = capture();
+    const model = new ScriptedModel([CRIT_FINDING, CRIT_FINDING, CRIT_FINDING]);
+    const result = await run(
+      { selfConsistency: true, event: { headSha: "abc" } },
+      { ...deps, fetchImpl: diffFetch(MODIFIED_FILE_DIFF), model: model as unknown as MockProvider },
+    );
+    expect(result.findings[0].severity).toBe("critical"); // reproduced → kept
+    expect(result.notices.some((n) => n.includes("self-consistency: demoted"))).toBe(false);
+  });
+
+  it("#13 chain-of-verification: the verifier stage completes with the v3 prompt loaded", async () => {
+    const { deps } = capture();
+    const model = new MockProvider(CRIT_FINDING);
+    const result = await run(
+      { verify: true, chainOfVerification: true, event: { headSha: "abc" } },
+      { ...deps, fetchImpl: diffFetch(MODIFIED_FILE_DIFF), model },
+    );
+    // The run reaches the verifier stage without error (fail-open on odd output).
+    expect(result.posted).toBe(true);
+    // The shipped v3 file carries the CoVe instruction the flag selects.
+    const { loadPromptTemplate } = await import("./prompt");
+    expect(loadPromptTemplate(undefined, "verifier-v3.md")).toContain("Chain of verification");
+  });
+});
+
+describe("runReview — Batch 2 context & recall (reports #17, #20, #16)", () => {
+  // A repo reader exposing a sibling test for src/app.ts (the fixture's file).
+  function testTreeReader() {
+    const REPO: Record<string, string> = {
+      "src/app.ts": "export function add() {}",
+      "src/app.test.ts": "import { add } from './app';\ntest('add', () => { add(); });",
+    };
+    return {
+      listTree: async () => Object.keys(REPO),
+      readFile: async (p: string) => REPO[p],
+    };
+  }
+
+  it("#17 related-tests: default ON injects the discovered sibling test into the reviewer prompt", async () => {
+    const { deps } = capture();
+    const model = new MockProvider("[]");
+    await run(
+      { event: { headSha: "abc" } },
+      { ...deps, fetchImpl: diffFetch(MODIFIED_FILE_DIFF), model, repoReader: testTreeReader() },
+    );
+    expect(model.requests[0].user).toContain("src/app.ts → src/app.test.ts");
+    // MODIFIED_FILE_DIFF adds `export function add(...)`, which the test references.
+    expect(model.requests[0].user).toContain("references add");
+  });
+
+  it("#17 related-tests: can be turned OFF", async () => {
+    const { deps } = capture();
+    const model = new MockProvider("[]");
+    await run(
+      { relatedTests: false, event: { headSha: "abc" } },
+      { ...deps, fetchImpl: diffFetch(MODIFIED_FILE_DIFF), model, repoReader: testTreeReader() },
+    );
+    expect(model.requests[0].user).not.toContain("src/app.test.ts");
+  });
+
+  it("#20 history: default OFF makes no blame call", async () => {
+    const urls: string[] = [];
+    const router: FetchLike = async (url) => {
+      urls.push(url);
+      return { ok: true, status: 200, text: async () => MODIFIED_FILE_DIFF };
+    };
+    const { deps } = capture();
+    await run({ event: { headSha: "abc" } }, { ...deps, fetchImpl: router, model: new MockProvider("[]") });
+    expect(urls.some((u) => u.includes("/graphql"))).toBe(false);
+  });
+
+  it("#20 history: when ON, injects a blame summary into the reviewer prompt", async () => {
+    const router: FetchLike = async (url) => {
+      if (url.includes("/graphql")) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () =>
+            JSON.stringify({
+              data: {
+                repository: {
+                  object: {
+                    blame: {
+                      ranges: [
+                        {
+                          startingLine: 1,
+                          endingLine: 7,
+                          commit: { oid: "abcdef1", committedDate: "2026-07-29T00:00:00Z", author: { name: "Alice" } },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            }),
+        };
+      }
+      return { ok: true, status: 200, text: async () => MODIFIED_FILE_DIFF };
+    };
+    const { deps } = capture();
+    const model = new MockProvider("[]");
+    await run(
+      { historyContext: true, event: { headSha: "abc" } },
+      { ...deps, fetchImpl: router, model, now: () => new Date("2026-07-30T00:00:00Z") },
+    );
+    expect(model.requests[0].user).toContain("last touched 1 day ago");
+    expect(model.requests[0].user).toContain("by 1 author");
+  });
+
+  it("#16 CI ingestion: injects lint diagnostics as verifier ground truth, not into the reviewer", async () => {
+    const { deps } = capture();
+    const model = new MockProvider(CRIT_FINDING);
+    const eslint = JSON.stringify([
+      { filePath: "/x/src/app.ts", messages: [{ ruleId: "no-unused-vars", severity: 2, message: "'v' is unused", line: 4 }] },
+    ]);
+    const result = await run(
+      { verify: true, ciOutputPath: "eslint.json", event: { headSha: "abc" } },
+      { ...deps, fetchImpl: diffFetch(MODIFIED_FILE_DIFF), model, ciIo: { readFile: () => eslint } },
+    );
+    expect(model.requests[0].user).not.toContain("no-unused-vars"); // reviewer never sees it
+    expect(model.requests.length).toBeGreaterThan(1);
+    expect(model.requests[1].user).toContain("no-unused-vars"); // verifier does
+    expect(result.notices.some((n) => n.includes("ingested 1 CI/lint diagnostic"))).toBe(true);
+  });
+
+  it("#16 CI ingestion: fail-soft when the path is unreadable", async () => {
+    const { deps } = capture();
+    const result = await run(
+      { ciOutputPath: "missing.json", event: { headSha: "abc" } },
+      {
+        ...deps,
+        fetchImpl: diffFetch(MODIFIED_FILE_DIFF),
+        model: new MockProvider("[]"),
+        ciIo: {
+          readFile: () => {
+            throw new Error("ENOENT");
+          },
+        },
+      },
+    );
+    expect(result.posted).toBe(true);
+    expect(result.notices.some((n) => n.includes("ingested"))).toBe(false);
+  });
+});
+
 describe("buildSummary", () => {
   const base = { findings: [], skippedFiles: [], exclusions: [], degraded: false, nothingReviewable: false };
 

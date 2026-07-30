@@ -134,6 +134,44 @@ function coerceSuggestedLine(obj: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
+/**
+ * The FIRST line of a contiguous multi-line committable range (feature #18).
+ * Read from range-start spellings ONLY — deliberately NOT `start_line`, because
+ * `coerceLine` already treats `start_line`/`startLine` as a fallback for the
+ * finding's (END) `line`, and reusing them here would make start === end. A
+ * positive integer or a decimal string; anything else → undefined.
+ */
+function coerceStartLine(obj: Record<string, unknown>): number | undefined {
+  for (const key of ["startLine", "rangeStart", "range_start", "fromLine", "from_line", "startLineNumber"]) {
+    const v = obj[key];
+    if (typeof v === "number" && Number.isInteger(v) && v >= 1) return v;
+    if (typeof v === "string" && /^\d+$/.test(v.trim())) {
+      const n = Number(v.trim());
+      if (n >= 1) return n;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Carry a committable MULTI-LINE contiguous replacement (feature #18). Like
+ * `coerceSuggestedLine` it PRESERVES each line's own leading indentation (GitHub
+ * replaces the whole anchored range) and strips only trailing newline(s), but
+ * REQUIRES two or more lines — a single line is the `coerceSuggestedLine` case,
+ * not a range. Empty / whitespace-only → rejected.
+ */
+function coerceSuggestedRange(obj: Record<string, unknown>): string | undefined {
+  for (const key of ["suggestedRange", "suggested_range", "replacementRange", "replacement_lines", "suggestedLines"]) {
+    const v = obj[key];
+    if (typeof v !== "string") continue;
+    const text = v.replace(/\r?\n+$/, ""); // drop trailing newline(s) only
+    if (text.trim().length === 0) continue; // empty / whitespace-only → not a fix
+    if (!/\r?\n/.test(text)) continue; // single line → use suggestedLine, not a range
+    return text;
+  }
+  return undefined;
+}
+
 /** Normalize one raw entry to a Finding, or undefined if it is unsalvageable. */
 function coerceFinding(entry: unknown): Finding | undefined {
   if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return undefined;
@@ -158,6 +196,8 @@ function coerceFinding(entry: unknown): Finding | undefined {
     body: body ?? (title as string),
     suggestion: firstString(obj, ["suggestion", "fix", "recommendation", "suggested_fix"]),
     suggestedLine: coerceSuggestedLine(obj),
+    startLine: coerceStartLine(obj),
+    suggestedRange: coerceSuggestedRange(obj),
   };
 }
 
@@ -180,6 +220,21 @@ export function parseModelFindings(raw: string): GuardrailResult {
     else droppedCount += 1;
   }
   return { findings, degraded: false, droppedCount };
+}
+
+/**
+ * Extract the optional walkthrough narrative (report item #26). When the
+ * `walkthrough` flag is on, the reviewer wraps its output as an object
+ * `{ "walkthrough": "...", "findings": [...] }` (the findings array is still
+ * read by parseModelFindings via its `findings` wrapper key). This pulls out the
+ * sibling narrative field, tolerating a few key spellings. Pure; never throws.
+ * Fails open: any non-object output, or a missing/empty field, → undefined.
+ */
+export function parseWalkthrough(raw: string): string | undefined {
+  if (typeof raw !== "string" || raw.trim().length === 0) return undefined;
+  const parsed = parseJsonCandidates(raw);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  return firstString(parsed as Record<string, unknown>, ["walkthrough", "effort", "overview", "narrative"]);
 }
 
 /**

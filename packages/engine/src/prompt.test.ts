@@ -1,9 +1,45 @@
 import { describe, expect, it } from "vitest";
 import type { DiffFile } from "./diff";
-import { buildSecurityChecklist, formatCommentableLines, loadPromptTemplate, renderPrompt } from "./prompt";
+import {
+  REVIEWER_FLAGGED_PROMPT_FILE,
+  REVIEWER_PROMPT_FILE,
+  buildFewShotExemplars,
+  buildSecurityChecklist,
+  formatCommentableLines,
+  loadPromptTemplate,
+  renderPrompt,
+  selectReviewerPrompt,
+} from "./prompt";
+
+describe("selectReviewerPrompt + few-shot exemplars (report items #14, #26)", () => {
+  it("stays on the v9 default when both flags are off", () => {
+    expect(selectReviewerPrompt({})).toBe(REVIEWER_PROMPT_FILE);
+    expect(selectReviewerPrompt({ fewShotExemplars: false, walkthrough: false })).toBe(REVIEWER_PROMPT_FILE);
+  });
+
+  it("switches to v10 when either flag is on", () => {
+    expect(selectReviewerPrompt({ fewShotExemplars: true })).toBe(REVIEWER_FLAGGED_PROMPT_FILE);
+    expect(selectReviewerPrompt({ walkthrough: true })).toBe(REVIEWER_FLAGGED_PROMPT_FILE);
+  });
+
+  it("buildFewShotExemplars is (none) when off and worked examples when on", () => {
+    expect(buildFewShotExemplars(false)).toBe("(none)");
+    const block = buildFewShotExemplars(true);
+    expect(block).toContain("true positive");
+    expect(block).toContain("false positive");
+  });
+
+  it("the v10 flagged template carries the two flag placeholders AND the v9 context blocks", () => {
+    const v10 = loadPromptTemplate(undefined, REVIEWER_FLAGGED_PROMPT_FILE);
+    expect(v10).toContain("{{FEWSHOT_EXEMPLARS}}");
+    expect(v10).toContain("{{WALKTHROUGH_INSTRUCTION}}");
+    expect(v10).toContain("{{RELATED_TESTS}}");
+    expect(v10).toContain("{{CODE_HISTORY}}");
+  });
+});
 
 describe("loadPromptTemplate", () => {
-  it("loads the default reviewer prompt (v7) from the repo prompts/ folder", () => {
+  it("loads the default reviewer prompt (v9) from the repo prompts/ folder", () => {
     const template = loadPromptTemplate();
     expect(template).toContain("Severity rubric");
     expect(template).toContain("Do NOT report");
@@ -12,6 +48,8 @@ describe("loadPromptTemplate", () => {
     expect(template).toContain("{{HOUSE_RULES}}");
     expect(template).toContain("{{CUSTOM_RULES}}");
     expect(template).toContain("{{CONTEXT}}");
+    expect(template).toContain("{{RELATED_TESTS}}");
+    expect(template).toContain("{{CODE_HISTORY}}");
     expect(template).toContain("{{RETRIEVED_CONTEXT}}");
     expect(template).toContain("{{PR_INTENT}}");
     expect(template).toContain("{{SECURITY_CHECKLIST}}");
@@ -49,6 +87,8 @@ describe("renderPrompt", () => {
       HOUSE_RULES: "(none)",
       CUSTOM_RULES: "(none)",
       CONTEXT: "(none)",
+      RELATED_TESTS: "(none)",
+      CODE_HISTORY: "(none)",
       RETRIEVED_CONTEXT: "(none)",
       PR_INTENT: "(none)",
       SECURITY_CHECKLIST: "(none)",

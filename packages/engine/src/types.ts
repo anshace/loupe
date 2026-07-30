@@ -22,6 +22,24 @@ export interface Finding {
    * line's own leading indentation; always a single line.
    */
   suggestedLine?: string;
+  /**
+   * The FIRST line of a contiguous multi-line committable replacement (feature
+   * #18): `line` is the LAST line of the range. Emitted by the reviewer ONLY
+   * together with `suggestedRange` when the fix cleanly swaps the whole block
+   * `[startLine..line]`. publish.ts renders a GitHub range ```suggestion block
+   * (start_line/start_side + line/side) ONLY when every line in that inclusive
+   * range is an EXACT commentable RIGHT-side line; otherwise it falls back to
+   * the single-line `suggestedLine` or the prose `suggestion`. Must be strictly
+   * less than `line` (a real ≥2-line range).
+   */
+  startLine?: number;
+  /**
+   * The EXACT replacement text for the whole `[startLine..line]` range (feature
+   * #18): one or more lines, each keeping its own leading indentation (GitHub
+   * replaces the entire anchored range). Distinct from the single-line
+   * `suggestedLine`; used only when a validated contiguous range exists.
+   */
+  suggestedRange?: string;
 }
 
 /** Which PR to review, independent of how the run was triggered. */
@@ -211,6 +229,110 @@ export interface EngineConfig {
   crossFileCallers?: boolean;
   /** Overrides for the cross-file import-scan budget; see DEFAULT_IMPORT_SCAN_CAPS. */
   crossFileCaps?: AgenticCaps;
+  /**
+   * Chain-of-verification (report item #13): the verifier states + answers 1–2
+   * falsifiable questions (within its capped grep/read budget) before each
+   * verdict, using the verifier-v3 prompt. Default OFF — an uncertain precision
+   * lever pending live-eval measurement (task 6.8-style); only takes effect when
+   * `verify` is also on.
+   */
+  chainOfVerification?: boolean;
+  /**
+   * Few-shot exemplars (report item #14): inject 2–4 curated true/false-positive
+   * examples into the reviewer prompt (reviewer-v8). Default OFF — unproven and
+   * costs tokens; pending live-eval measurement (task 6.8-style).
+   */
+  fewShotExemplars?: boolean;
+  /**
+   * Self-consistency voting (report item #15): re-run the reviewer 1–2× at
+   * temperature > 0 on critical/high findings; a high-stakes finding not
+   * reproduced by a majority of samples is DEMOTED one severity (never silently
+   * dropped). Bounded to the per-run cost cap. Default OFF — an uncertain
+   * precision lever pending live-eval measurement (task 6.8-style).
+   */
+  selfConsistency?: boolean;
+  /**
+   * Walkthrough narrative (report item #26): the reviewer emits an optional
+   * sibling `walkthrough`/`effort` field on its JSON, rendered in the summary.
+   * Fails open (absent field → nothing). Default OFF — a trust/UX polish lever
+   * pending live-eval measurement (task 6.8-style).
+   */
+  walkthrough?: boolean;
+  /**
+   * Related-tests context (report item #17): discover each changed source
+   * file's sibling test(s) via the repo tree and inject a {{RELATED_TESTS}}
+   * reviewer block, enabling a FACTUAL coverage-gap observation. Default ON —
+   * deterministic and "(none)"-safe (no matches → no prompt noise); one cached
+   * tree listing + a few bounded test reads. Fail-soft.
+   */
+  relatedTests?: boolean;
+  /**
+   * Git blame / history context (report item #20): fetch a per-file blame
+   * summary of how old / how churny each changed region is and inject it as the
+   * {{CODE_HISTORY}} reviewer block + verifier ground truth (evidence for the
+   * `pre-existing` drop reason). Default OFF — it costs one GraphQL call per
+   * changed file, so (like crossFileCallers/rag) it stays opt-in until the eval
+   * set measures the precision win. Fail-soft; determinism via `deps.now`.
+   */
+  historyContext?: boolean;
+  /**
+   * Local path to the repo's EXISTING CI/lint/type-checker output — SARIF,
+   * ESLint JSON, or raw `tsc` text (report item #16). When set, the engine
+   * parses it, filters to the touched files, and injects it as CITED,
+   * deterministic ground truth for the verifier to cross-reference. Set by the
+   * TRUSTED operator/Action, NEVER from the attacker-controllable .aireview.toml.
+   * Consumed only by the verifier, so it is ingested only when `verify` is on.
+   * Absent → skipped (fail-soft); read via `deps.ciIo`.
+   */
+  ciOutputPath?: string;
+  /** CI output format; "auto" (default) sniffs SARIF / ESLint-JSON / tsc text. */
+  ciOutputFormat?: "sarif" | "eslint" | "tsc" | "auto";
+  /**
+   * Blast-radius + churn model escalation (report item #19): OR two extra
+   * deterministic signals into the escalation decision — a changed file imported
+   * by many OTHER files (import-graph blast radius) OR a changed file with recent
+   * revert/hotfix churn in its git history. Default OFF: although the signals are
+   * deterministic, gathering them costs a whole-repo import scan plus one
+   * commit-history call per changed file, so (free-tier-first) it stays opt-in —
+   * like `crossFileCallers`/`historyContext`. The risky-PATH escalation signal
+   * (`escalation`) remains default ON regardless.
+   */
+  blastRadiusEscalation?: boolean;
+  /** Importer-count threshold for the blast-radius signal; see DEFAULT_BLAST_RADIUS_THRESHOLD. */
+  blastRadiusThreshold?: number;
+  /**
+   * Deterministic dependency review (report item #22): flag NEW dependencies
+   * added to a package.json manifest as a heads-up and, from the lockfile,
+   * new deps declaring an INSTALL SCRIPT (arbitrary code on `npm install`).
+   * Zero network. Default ON — deterministic, scoped to manifest/lockfile diffs,
+   * and low-noise (skips runs with no dependency changes).
+   */
+  dependencyReview?: boolean;
+  /**
+   * Optional network dependency audit (report item #22): OSV.dev `querybatch`
+   * for known CVEs on the new deps + npm-registry license lookup (copyleft
+   * heads-up). Default OFF — it makes network calls, so it stays opt-in; only
+   * takes effect when `dependencyReview` produced new deps to audit.
+   */
+  dependencyAudit?: boolean;
+  /**
+   * Dangerous-sink rule pack + taint prompting (report item #21): a hand-rolled
+   * per-language pattern pack (eval/exec, innerHTML, raw SQL concat,
+   * child_process, ReDoS, Python shell=True, …) whose matches are injected into
+   * the reviewer prompt as PRE-FLAGGED evidence the model must reason about —
+   * requiring source→sink reachability before a high/critical. Selects
+   * reviewer-v11. Default OFF — an uncertain precision lever pending live-eval
+   * measurement (task 6.8-style).
+   */
+  sinkPack?: boolean;
+  /**
+   * Prompt-injection self-defense (report item #23): strip zero-width/bidi
+   * Unicode and neutralize injection-marker phrases in the attacker-reachable
+   * text templated into prompts (the diff, HOUSE_RULES.md, .aireview.toml custom
+   * rules, PR intent), surfacing a notice. Default ON — deterministic and it
+   * protects Loupe itself; set false only to disable for debugging.
+   */
+  injectionDefense?: boolean;
 }
 
 /** A file excluded before review, with the reason, for summary disclosure. */
@@ -261,6 +383,15 @@ export interface ReviewComment {
   path: string;
   line: number;
   side: "RIGHT";
+  /**
+   * Multi-line committable range (feature #18): the FIRST line of a contiguous
+   * RIGHT-side range whose LAST line is `line`. Present ONLY when the whole
+   * inclusive range was validated as exact commentable lines, so GitHub renders
+   * the ```suggestion as a range replacement. Absent → an ordinary single-line
+   * comment. Always paired with `startSide` and always strictly less than `line`.
+   */
+  startLine?: number;
+  startSide?: "RIGHT";
   body: string;
 }
 
@@ -312,6 +443,11 @@ export interface ReviewResult {
   verification?: VerificationRecord;
   /** Agentic tool-loop counters, present only when agentic mode was on. */
   agenticUsage?: AgenticUsage;
+  /**
+   * Reviewer-authored walkthrough narrative (report item #26), present only when
+   * the `walkthrough` flag is on and the model emitted a non-empty field.
+   */
+  walkthrough?: string;
 }
 
 const SEVERITY_RANK: Record<Severity, number> = {

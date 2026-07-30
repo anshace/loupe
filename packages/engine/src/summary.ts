@@ -86,6 +86,11 @@ export interface SummaryCommentParts {
   publishedFindings?: Finding[];
   /** Deterministic risk verdict inputs (#9b). Absent → no risk line. */
   risk?: RiskSignals;
+  /**
+   * Reviewer-authored walkthrough narrative (report item #26). Absent → no
+   * walkthrough section. Rendered collapsed so it never crowds the findings.
+   */
+  walkthrough?: string;
   degraded: boolean;
   nothingReviewable: boolean;
   /** Findings that could only be mentioned here (not inline / file-level). */
@@ -232,6 +237,12 @@ export function composeSummaryComment(parts: SummaryCommentParts): string {
   // Deterministic at-a-glance risk verdict (#9b) — reuses signals already computed.
   if (parts.risk && !parts.degraded && !parts.nothingReviewable) {
     sections.push(composeRiskLine(parts.risk, parts.publishedFindings ?? []));
+  }
+
+  // Optional reviewer walkthrough narrative (#26) — collapsed so it stays out of
+  // the way of the findings; only present when the walkthrough flag produced one.
+  if (parts.walkthrough && parts.walkthrough.trim().length > 0 && !parts.degraded && !parts.nothingReviewable) {
+    sections.push(`<details>\n<summary><strong>Walkthrough</strong></summary>\n\n${parts.walkthrough.trim()}\n\n</details>`);
   }
 
   // Severity-grouped, severity-first findings table (#9a/#9d).

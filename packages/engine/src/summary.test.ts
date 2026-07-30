@@ -78,6 +78,26 @@ describe("composeSummaryComment", () => {
   });
 });
 
+describe("composeSummaryComment — walkthrough narrative (report item #26)", () => {
+  it("renders the walkthrough collapsed when present", () => {
+    const body = composeSummaryComment({
+      ...baseParts,
+      findingsPublished: 1,
+      walkthrough: "This PR tightens pricing validation.",
+    });
+    expect(body).toContain("<summary><strong>Walkthrough</strong></summary>");
+    expect(body).toContain("This PR tightens pricing validation.");
+  });
+
+  it("omits the walkthrough section when absent, empty, or degraded", () => {
+    expect(composeSummaryComment(baseParts)).not.toContain("Walkthrough");
+    expect(composeSummaryComment({ ...baseParts, walkthrough: "   " })).not.toContain("Walkthrough");
+    expect(
+      composeSummaryComment({ ...baseParts, degraded: true, walkthrough: "ignored on degraded" }),
+    ).not.toContain("Walkthrough");
+  });
+});
+
 describe("composeSummaryComment — summary polish bundle (feature #9)", () => {
   const crit: Finding = { severity: "critical", category: "security", file: "src/auth.ts", line: 12, title: "Auth bypass", body: "b" };
   const med: Finding = { severity: "medium", category: "bug", file: "src/util.ts", line: 3, title: "Edge case", body: "b" };

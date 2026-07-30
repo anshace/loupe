@@ -218,6 +218,22 @@ export function importersFromScan(
 }
 
 /**
+ * Blast-radius counts (report item #19): for each target path, how many OTHER
+ * files in a completed scan import it. Pure — the caller runs the scan once and
+ * reuses it. Feeds escalate.highBlastRadiusPaths.
+ */
+export function countImporters(
+  scan: RepoImportScan,
+  targetPaths: readonly string[],
+): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const path of targetPaths) {
+    counts.set(path, importersFromScan(scan, path).length);
+  }
+  return counts;
+}
+
+/**
  * Reverse-import lookup for the `find_importers` agentic tool: which files
  * import `targetPath`. Scans the whole tree under the shared caps/usage. When
  * `symbols` are given, importers referencing those symbols are ranked first and
