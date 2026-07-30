@@ -217,18 +217,19 @@ phase (task 6.8-style measurement) before they change default behavior:
 **Not yet done from Tier 2:** none — all #13–26 landed (uncertain ones gated
 behind default-off flags pending live measurement).
 
-**Tier 3 — nice-to-have / higher effort / needs prior substrate (items
-#27–33):** bounded "verifier-of-verifier" reflection (#27), a JSON
-field-ordering experiment flagged as uncertain-value by the source research
-(#28), empirical calibration mined from run-log history (#29), calibration
-metrics — Brier/ECE/Cohen's kappa (#30), a learned-rule suggestion queue
-(#31, effort L, needs #12 first), conversational in-thread replies (#32,
-**Worker/App path only** — blocked on Mode A shipping), and a real TS
-language service + `tsc` diagnostics (#33, effort L). A lower-priority
-rounding-out list (ctags-lite index, concurrency/resource-leak checklist,
-ranked repo-map priming, public benchmark adapters, shadow-mode dual-run,
-promptfoo, DSPy tuning) sits below all of the above — build only on
-demonstrated need.
+**Tier 3 (items #27–33) + Tier-1 #12 — SHIPPED 2026-07-30** (commits `4829f1a`,
+`146fa0c`): feedback-observability capture (#12) + learned-rule suggestions to a
+local file (#31), verifier-of-verifier reflection (#27), grounding-first prompt
+variant (#28), empirical calibration pre-suppression (#29), Brier/ECE/Cohen's
+kappa metrics (#30), conversational in-thread replies in the Worker (#32), and a
+real in-memory TS language service (`packages/ts-symbols`, `typescript` isolated
+to that package) with find-def/refs/hover + `tsc` diagnostics (#33). Rounding-out
+items shipped too: ctags-lite index, repo-map priming, concurrency/resource-leak
+checklist, shadow-mode eval, local benchmark adapters. Uncertain-precision items
+gated behind default-off flags. **promptfoo / DSPy deliberately NOT built** —
+documented as external tools in [`docs/external-tooling-notes.md`](../docs/external-tooling-notes.md)
+(zero-dep/local ethos). All feature backlog is now cleared; remaining work is the
+live-verification phase and any Mode-A (App) deployment.
 
 **Recorded out-of-scope** (not omissions — deliberate calls, with
 substitutes noted): cross-vendor model ensembles, a full adversarial
