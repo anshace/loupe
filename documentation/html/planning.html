@@ -315,16 +315,17 @@ li.task input[type="checkbox"]:checked {
 <hr>
 <h2>5. Feature backlog (from research/10)</h2>
 <p>Full ranked list, merge map, and rationale: <a href="../research/10-feature-improvements.md"><code>research/10-feature-improvements.md</code></a>. This section is a decision aid, not a restatement — read the source file before picking the next batch.</p>
-<p><strong>Tier 1 (items #1–12)</strong> is the set already largely delivered by the quality round in §2 above; items #11 (eval trend log) and #12 (feedback-observability capture) are the two not yet confirmed shipped — cheapest next pickup if Tier 1 needs closing out before moving to Tier 2.</p>
-<p><strong>Tier 2 — worthwhile, medium effort, validate on the eval harness (items #13–26):</strong> groups into four themes —</p>
-<ul><li><em>Precision:</em> chain-of-verification questions in the verifier (#13),</li></ul>
-<p>  few-shot exemplars mined from Loupe&#x27;s own drops (#14), self-consistency   voting scoped to critical/high findings (#15), ingesting the repo&#x27;s   existing lint/tsc/SARIF output as verifier ground truth (#16), git   blame/history context for the verifier&#x27;s <code>pre-existing</code> drop-reason (#20).</p>
+<p><strong>Tier 1 (items #1–12)</strong> was delivered by the quality round in §2 above. Item #11 (eval trend log) also shipped in the Tier 2 round below. The one Tier-1 item still open is <strong>#12 (feedback-observability capture)</strong> — reading reaction/resolution state on Loupe&#x27;s own prior comments; cheapest next pickup.</p>
+<p><strong>Tier 2 (items #13–26) — SHIPPED 2026-07-30</strong> (commit <code>0c07bf1</code>). Delivered in four batches; the precision items that the research flags as &quot;not guaranteed wins&quot; ship <strong>behind <code>EngineConfig</code> flags, default OFF</strong>, awaiting the live-eval phase (task 6.8-style measurement) before they change default behavior:</p>
+<ul><li><em>Precision (flags default off):</em> chain-of-verification verifier prompt (#13,</li></ul>
+<p>  <code>chainOfVerification</code>), few-shot exemplars (#14, <code>fewShotExemplars</code>),   self-consistency voting on critical/high with demote-not-drop (#15,   <code>selfConsistency</code>), dangerous-sink/taint pack (#21, flag). <strong>Active:</strong> ingest   existing lint/tsc/SARIF as verifier ground truth (#16, operator-configured   path), git blame/history for the <code>pre-existing</code> drop-reason (#20, <code>historyContext</code>).</p>
 <ul><li><em>Recall + actionability:</em> related-tests discovery + coverage-gap findings</li></ul>
-<p>  (#17), multi-line suggestion ranges (#18), blast-radius/churn escalation   signals building on the import-graph tool (#19).</p>
-<ul><li><em>Heavier security:</em> a hand-rolled dangerous-sink/taint rule pack (#21,</li></ul>
-<p>  effort L), supply-chain/CVE + license checks on new dependencies (#22).</p>
-<ul><li><em>Loupe&#x27;s own security + measurement:</em> prompt-injection self-defense on</li></ul>
-<p>  attacker-reachable prompt content (#23), an A/B + regression eval harness   with McNemar testing (#24), mining real bug-fix commits into a larger eval   corpus via SZZ (#25, effort L), and an optional walkthrough narrative field   (#26, polish).</p>
+<p>  (#17, default on), multi-line suggestion ranges (#18), blast-radius/churn   escalation (#19).</p>
+<ul><li><em>Security:</em> supply-chain new-dependency/install-script checks (#22),</li></ul>
+<p>  prompt-injection self-defense (#23, <strong>default ON</strong> — protects Loupe itself).</p>
+<ul><li><em>Measurement:</em> A/B + regression eval harness (#24), SZZ bug-corpus mining</li></ul>
+<p>  (#25, local repos only), eval trend log + local HTML (#11), optional   walkthrough narrative (#26, flag). See <a href="../evals/README.md"><code>evals/README.md</code></a>.</p>
+<p><strong>Not yet done from Tier 2:</strong> none — all #13–26 landed (uncertain ones gated behind default-off flags pending live measurement).</p>
 <p><strong>Tier 3 — nice-to-have / higher effort / needs prior substrate (items #27–33):</strong> bounded &quot;verifier-of-verifier&quot; reflection (#27), a JSON field-ordering experiment flagged as uncertain-value by the source research (#28), empirical calibration mined from run-log history (#29), calibration metrics — Brier/ECE/Cohen&#x27;s kappa (#30), a learned-rule suggestion queue (#31, effort L, needs #12 first), conversational in-thread replies (#32, <strong>Worker/App path only</strong> — blocked on Mode A shipping), and a real TS language service + <code>tsc</code> diagnostics (#33, effort L). A lower-priority rounding-out list (ctags-lite index, concurrency/resource-leak checklist, ranked repo-map priming, public benchmark adapters, shadow-mode dual-run, promptfoo, DSPy tuning) sits below all of the above — build only on demonstrated need.</p>
 <p><strong>Recorded out-of-scope</strong> (not omissions — deliberate calls, with substitutes noted): cross-vendor model ensembles, a full adversarial multi-stage refute/promote pipeline, a persisted SCIP/LSIF graph index, shelling out to real SAST tools (Semgrep/CodeQL), and autofix/CI-log correlation. Rationale for each is in <code>research/10</code>&#x27;s &quot;OUT OF SCOPE&quot; table.</p>
 <hr>

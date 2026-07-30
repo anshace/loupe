@@ -190,28 +190,32 @@ Full ranked list, merge map, and rationale:
 This section is a decision aid, not a restatement — read the source file
 before picking the next batch.
 
-**Tier 1 (items #1–12)** is the set already largely delivered by the quality
-round in §2 above; items #11 (eval trend log) and #12 (feedback-observability
-capture) are the two not yet confirmed shipped — cheapest next pickup if
-Tier 1 needs closing out before moving to Tier 2.
+**Tier 1 (items #1–12)** was delivered by the quality round in §2 above.
+Item #11 (eval trend log) also shipped in the Tier 2 round below. The one
+Tier-1 item still open is **#12 (feedback-observability capture)** — reading
+reaction/resolution state on Loupe's own prior comments; cheapest next pickup.
 
-**Tier 2 — worthwhile, medium effort, validate on the eval harness (items
-#13–26):** groups into four themes —
-- *Precision:* chain-of-verification questions in the verifier (#13),
-  few-shot exemplars mined from Loupe's own drops (#14), self-consistency
-  voting scoped to critical/high findings (#15), ingesting the repo's
-  existing lint/tsc/SARIF output as verifier ground truth (#16), git
-  blame/history context for the verifier's `pre-existing` drop-reason (#20).
+**Tier 2 (items #13–26) — SHIPPED 2026-07-30** (commit `0c07bf1`). Delivered in
+four batches; the precision items that the research flags as "not guaranteed
+wins" ship **behind `EngineConfig` flags, default OFF**, awaiting the live-eval
+phase (task 6.8-style measurement) before they change default behavior:
+- *Precision (flags default off):* chain-of-verification verifier prompt (#13,
+  `chainOfVerification`), few-shot exemplars (#14, `fewShotExemplars`),
+  self-consistency voting on critical/high with demote-not-drop (#15,
+  `selfConsistency`), dangerous-sink/taint pack (#21, flag). **Active:** ingest
+  existing lint/tsc/SARIF as verifier ground truth (#16, operator-configured
+  path), git blame/history for the `pre-existing` drop-reason (#20, `historyContext`).
 - *Recall + actionability:* related-tests discovery + coverage-gap findings
-  (#17), multi-line suggestion ranges (#18), blast-radius/churn escalation
-  signals building on the import-graph tool (#19).
-- *Heavier security:* a hand-rolled dangerous-sink/taint rule pack (#21,
-  effort L), supply-chain/CVE + license checks on new dependencies (#22).
-- *Loupe's own security + measurement:* prompt-injection self-defense on
-  attacker-reachable prompt content (#23), an A/B + regression eval harness
-  with McNemar testing (#24), mining real bug-fix commits into a larger eval
-  corpus via SZZ (#25, effort L), and an optional walkthrough narrative field
-  (#26, polish).
+  (#17, default on), multi-line suggestion ranges (#18), blast-radius/churn
+  escalation (#19).
+- *Security:* supply-chain new-dependency/install-script checks (#22),
+  prompt-injection self-defense (#23, **default ON** — protects Loupe itself).
+- *Measurement:* A/B + regression eval harness (#24), SZZ bug-corpus mining
+  (#25, local repos only), eval trend log + local HTML (#11), optional
+  walkthrough narrative (#26, flag). See [`evals/README.md`](../evals/README.md).
+
+**Not yet done from Tier 2:** none — all #13–26 landed (uncertain ones gated
+behind default-off flags pending live measurement).
 
 **Tier 3 — nice-to-have / higher effort / needs prior substrate (items
 #27–33):** bounded "verifier-of-verifier" reflection (#27), a JSON
